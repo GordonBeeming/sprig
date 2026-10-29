@@ -341,7 +341,7 @@ mod native {
             return Err(Error::new("E_UNSUPPORTED", "only macOS/APFS is supported"));
         }
         if value.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0 {
-            return Err(Error::new("E_UNSUPPORTED", "APFS volumes with ownership disabled cannot enforce workspace permission safeguards"));
+            return Err(Error::new("E_UNSUPPORTED", "APFS volumes with ownership disabled cannot enforce workspace permission safeguards; enable ownership in macOS before using this volume"));
         }
         Ok(())
     }
@@ -416,6 +416,7 @@ pub fn sync_dir(path: &Path) -> Result<()> {
 pub fn validate_workspace_parent(path: &Path) -> Result<()> {
     let user = unsafe { libc::geteuid() };
     for directory in path.ancestors() {
+        supported(directory)?;
         let metadata = fs::symlink_metadata(directory)?;
         if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
             return Err(Error::new(

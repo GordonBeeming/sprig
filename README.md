@@ -29,6 +29,8 @@ The first command creates a detached workspace at the source's HEAD. Choose one 
 
 New workspace roots are private (`0700`). Creation requires parent directories and their ancestors to be owned by the current user or root. Group/world-writable ancestors require sticky-directory protection; allow ACL entries are conservatively rejected. APFS volumes with ownership disabled are unsupported because they cannot enforce these permission safeguards. Reservation identity is checked before Git registration and materialisation; the tool does not follow a substituted destination symlink.
 
+External APFS drives can mount with ownership disabled. Enable volume ownership through macOS before using them; the tool never changes mount ownership settings itself. Creation also checks the filesystems of ancestor directories, including across mount boundaries.
+
 Creation requires a clean source: no staged, unstaged, conflicted or non-ignored untracked files. Ignored files are omitted. The initial dependency/cache policy is `copy.ignored = "none"`; no ignored directories, environment files or credentials are copied. If a target has no reusable files, creation reports `W_NO_SHARED_FILES` and partial success so the absence of sharing is visible.
 
 Creation also screens donor metadata: files with ACLs or xattrs other than the OS-generated `com.apple.provenance` are materialised through Git, so donor-only private metadata is not copied into the new workspace. Conversion instead preserves the existing target's metadata.
