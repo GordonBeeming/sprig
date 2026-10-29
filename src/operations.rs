@@ -324,14 +324,21 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
                         && before.xattrs.keys().all(|k| k == "com.apple.provenance")
                     {
                         platform::clone(&donor, &target_path)?;
+                        platform::preserve_group(&target_path, before.gid)?;
+                        state::boundary("create_cloned")?;
                         let after = platform::fingerprint(&target_path)?;
-                        if !before.preserves(&after)
-                            || !platform::fingerprint(&donor)?.unchanged(&before)
-                        {
+                        if !before.preserves(&after) {
                             return Err(Error::new(
                                 "E_CHANGED",
-                                "source or clone metadata/bytes changed during creation",
-                            ));
+                                format!("clone metadata/bytes did not match source: {}", target_path.display()),
+                            ).with_data(json!({"path":target_path,"source":donor,"kind":"clone_preservation","expected":before,"observed":after})));
+                        }
+                        let donor_after = platform::fingerprint(&donor)?;
+                        if !donor_after.unchanged(&before) {
+                            return Err(Error::new(
+                                "E_CHANGED",
+                                format!("source metadata/bytes changed during creation: {}", donor.display()),
+                            ).with_data(json!({"path":donor,"kind":"source_changed","expected":before,"observed":donor_after})));
                         }
                         seeded = true;
                         cloned += 1;

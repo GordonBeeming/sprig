@@ -427,6 +427,73 @@ class Acceptance(unittest.TestCase):
         self.assertGreater(out["data"]["replaced_files"], 0)
         self.assertNotEqual(run("xattr", "-p", "test.donor-only", str(target / "b"), check=False).returncode, 0)
 
+    def test_create_preserves_group_across_shared_destination_roots(self):
+        base = Path(tempfile.mkdtemp(prefix="sprig-group-source-", dir=Path.home()))
+        self.addCleanup(shutil.rmtree, base)
+        f = Fixture(base)
+        before = f.state(f.repo)
+        for parent in [Path("/private/tmp"), Path("/Users/Shared")]:
+            with self.subTest(parent=parent):
+                with tempfile.TemporaryDirectory(prefix="sprig-group-", dir=parent) as directory:
+                    target = Path(directory) / "workspace"
+                    self.assertNotEqual((f.repo / "a").stat().st_gid, Path(directory).stat().st_gid)
+                    out, _ = f.sprig("create", target, "--from", f.repo,
+                                     "--new-branch", "gb/fix/group-" + parent.name,
+                                     "--no-time-machine-exclude")
+                    self.assertGreater(out["data"]["cloned_files"], 0)
+                    for name in [".gitignore", "a", "b", "executable"]:
+                        source, clone = f.repo / name, target / name
+                        self.assertEqual(source.stat().st_gid, clone.stat().st_gid)
+                        self.assertEqual(source.stat().st_mode, clone.stat().st_mode)
+                        self.assertEqual(source.read_bytes(), clone.read_bytes())
+                    self.assertEqual(f.git("status", "--porcelain", path=target), b"")
+                    self.assertFalse(list((f.repo / ".git/tool/operations").glob("*.json")))
+                    f.git("worktree", "remove", str(target))
+        self.assertEqual(before, f.state(f.repo))
+        f.sprig("create", f.base / "following", "--from", f.repo, "--no-time-machine-exclude")
+
+    def test_creation_change_diagnostics_name_path_and_metadata(self):
+        for kind in ["clone", "source"]:
+            with self.subTest(kind=kind):
+                base = self.f.base / ("change-" + kind)
+                base.mkdir()
+                f = Fixture(base)
+                target = base / "workspace"
+                ready, release = base / "ready", base / "release"
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="create_cloned",
+                           SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                          "--no-time-machine-exclude"], env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    clone = target / ".gitignore"
+                    changed = clone if kind == "clone" else f.repo / ".gitignore"
+                    if kind == "clone":
+                        changed.chmod(0o600)
+                    else:
+                        changed.write_bytes(b"external source change\n")
+                    release.write_text("continue")
+                    stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                    self.assertEqual(child.returncode, 4, (stdout, stderr))
+                    out = json.loads(stdout)
+                    self.assertEqual(out["code"], "E_CHANGED")
+                    detail = out["data"]["source_error"]
+                    self.assertEqual(detail["path"], str(changed.resolve()))
+                    self.assertEqual(detail["kind"], "clone_preservation" if kind == "clone" else "source_changed")
+                    field = "mode" if kind == "clone" else "digest"
+                    self.assertNotEqual(detail["expected"][field], detail["observed"][field])
+                    self.assertIn(str(changed.resolve()), out["message"])
+                    self.assertTrue(changed.exists())
+                    self.assertTrue(out["data"]["recovery_requires_inspection"])
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate()
+
     def test_creation_hook_and_partial_success(self):
         f = self.f
         hook = f.repo / ".git/hooks/post-checkout"
