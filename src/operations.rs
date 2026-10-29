@@ -469,11 +469,11 @@ pub fn convert(
         if !root.is_dir() {
             continue;
         }
-        let donor = Repository::open(root)?;
-        donor.preflight(&donor.head()?)?;
         if fs::metadata(root)?.dev() != dev {
             continue;
         }
+        let donor = Repository::open(root)?;
+        donor.preflight(&donor.head()?)?;
         donor_snapshots.push((donor.clone(), donor.snapshot()?));
         let modified = donor.modified()?;
         for e in donor.index()? {
@@ -780,6 +780,20 @@ pub fn recover(path: &Path, acknowledge_create: bool) -> Result<Output> {
         {
             return Err(Error::new("E_STATE", "unsafe journal sibling"));
         }
+        let sibling_exists = match fs::symlink_metadata(sibling) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !sibling_exists
+            && ((j.clone.is_none() && j.stage == "reserved")
+                || (j.clone.is_some() && j.stage == "cloned"))
+        {
+            // These stages cannot have installed a clone; no retained original needs protection.
+            recovered.push(record.path.clone());
+            record.finish()?;
+            continue;
+        }
         let relative = j
             .target
             .strip_prefix(&repo.root)
@@ -789,21 +803,19 @@ pub fn recover(path: &Path, acknowledge_create: bool) -> Result<Output> {
             .original
             .as_ref()
             .ok_or_else(|| Error::new("E_STATE", "original fingerprint missing"))?;
-        let current = platform::fingerprint(&j.target)?;
         match &j.clone {
             None => {
-                if current.identity() != original.identity() || !current.equivalent(original) {
-                    return Err(Error::new(
-                        "E_RECOVERY",
-                        "original changed; preserve all recovery files for manual resolution",
-                    ));
-                }
-                if fs::symlink_metadata(sibling).is_ok() {
+                if sibling_exists {
                     return Err(Error::new("E_RECOVERY", format!("uncheckpointed clone retained at {}; ownership cannot be proven, inspect and remove it manually, then retry", sibling.display())));
                 }
+                return Err(Error::new(
+                    "E_STATE",
+                    "inconsistent conversion journal stage",
+                ));
             }
             Some(clone) => {
-                if fs::symlink_metadata(sibling).is_ok() {
+                let current = platform::fingerprint(&j.target)?;
+                if sibling_exists {
                     let other = platform::fingerprint(sibling)?;
                     if j.stage == "cloned"
                         && current.identity() == original.identity()

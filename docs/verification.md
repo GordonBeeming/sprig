@@ -8,7 +8,7 @@ The implementation was built on Apple Silicon with macOS 27.2, Rust 1.89 and ins
 | --- | --- |
 | Formatting and linting | `cargo fmt --all -- --check`; `cargo clippy --all-targets -- -D warnings` |
 | Rust test command | `cargo test --locked`: CLI acceptance driver and native metadata/swap test pass |
-| CLI scenarios | 33 scenarios pass on Git 2.53; the original 31 also passed on an actual Git 2.43.0 binary |
+| CLI scenarios | 34 scenarios pass on Git 2.53; the original 31 also passed on an actual Git 2.43.0 binary |
 | Git minimum | Built the [official Git 2.43.0 release](https://www.kernel.org/pub/software/scm/git/git-2.43.0.tar.gz) in a temporary directory and reran all CLI scenarios. Local-command compatibility build disabled curl, OpenSSL, gettext and Tcl/Tk; network operations were not tested. System Git was unchanged. |
 | Native metadata | Real APFS clone, target mode, ACL, xattr removal/copy, atime, birth time, swap and independent writes |
 | Git interoperability | Requested refs/branches, linked sources, SHA-256 objects, clean status, diff and ordinary worktree removal. A separate disposable smoke test made and verified a normal signed commit through installed Git. |
@@ -50,3 +50,5 @@ Creation journals deliberately retain uncertain state until inspection and expli
 Remaining limits are documented in the [README](../README.md): macOS/APFS only, unsupported Git features rejected, ignored-cache policy limited to `none`, residual external-writer races, manual inspection of uncheckpointed clones, and no power-loss guarantee. Rust 1.85 is the declared dependency/API floor; these runs used Rust 1.89.
 
 The pre-release check added regressions for metadata-only donor timestamp changes and staged renames with newline paths. Git name-only diff can report stat-only changes while index auto-refresh is disabled; selection now uses porcelain status, which verifies contents in memory without writing the index. Independent review checked that parser and the PR CI workflow.
+
+PR review added a recovery regression covering reserved/cloned journals with no sibling after the target is edited or deleted. Recovery clears only the pre-swap journal and preserves the current Git state. The bounded APFS volume test also registers a busy donor on another volume and verifies it is ignored before any donor Git preflight.

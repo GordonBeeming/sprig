@@ -389,6 +389,31 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(config, (f.repo / ".git/config").read_bytes())
         self.assertEqual((f.repo / "a").read_bytes(), b"original data\n" * 100)
 
+    def test_pre_swap_missing_sibling_does_not_block_user_edits(self):
+        f = self.f
+        for stage in ["reserved", "cloned"]:
+            for edit in ["changed", "deleted"]:
+                with self.subTest(stage=stage, edit=edit):
+                    target = f.ordinary(stage + edit)
+                    point = "convert_reserved" if stage == "reserved" else "convert_metadata"
+                    env = dict(f.env, TOOL_TEST_FAULTS="1", TOOL_TEST_CRASH=point)
+                    result = run(BINARY, "convert", str(target), "--no-time-machine-exclude", env=env, check=False)
+                    self.assertEqual(result.returncode, 91)
+                    journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+                    Path(journal["sibling"]).unlink(missing_ok=True)
+                    path = Path(journal["target"])
+                    if edit == "changed":
+                        path.write_bytes(b"user edit after failure")
+                    else:
+                        path.unlink()
+                    before = f.state(target)
+                    f.tool("recover", target)
+                    self.assertEqual(before, f.state(target))
+                    if edit == "changed":
+                        self.assertEqual(path.read_bytes(), b"user edit after failure")
+                    else:
+                        self.assertFalse(path.exists())
+
     def test_recovery_after_owned_sibling_already_removed(self):
         f = self.f; target = f.ordinary()
         before = f.state(target)

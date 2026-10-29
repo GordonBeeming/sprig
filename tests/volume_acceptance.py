@@ -33,6 +33,13 @@ with tempfile.TemporaryDirectory(prefix="tool-volume-acceptance-") as base_name:
             out, _ = f.tool("create", destination, "--from", f.repo, "--no-time-machine-exclude", code=3)
             assert out["code"] == "E_CLONE" and not destination.exists()
             assert source_before == f.state(f.repo)
+            external = base / "different-volume-donor"
+            f.git("worktree", "add", "--detach", str(external), f.head)
+            admin = Path(f.git("rev-parse", "--absolute-git-dir", path=external).decode().strip())
+            (admin / "index.lock").write_text("busy donor on incompatible volume")
+            f.tool("convert", target, "--dry-run")
+            assert before == f.state(target)
+            (admin / "index.lock").unlink()
             filler = mount / "bounded-fill"
             exhausted = False
             with filler.open("wb", buffering=0) as file:

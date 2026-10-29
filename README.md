@@ -46,6 +46,8 @@ tool recover ../workspace --json
 
 Recovery verifies file identities and contents before removing a known sibling. It retains changed or unknown files for manual resolution. A crash immediately after native cloning but before its ownership checkpoint can leave an uncheckpointed sibling: inspect it, remove it only when satisfied it is disposable, then retry recovery. Neither recovery nor normal cleanup prunes unrelated Git registrations or deletes branches.
 
+If a journal proves no swap occurred and its sibling is already absent, recovery clears only that journal. Later user edits or deletion of the target do not block this cleanup.
+
 Interrupted creation retains its directory, any branch/registration and its journal. Inspect HEAD, index and local files first. A registered directory with no index needs `git read-tree HEAD` only after checking that no user index state needs saving; `git checkout-index --all` can restore missing paths without `--force`. `tool recover <repository> --acknowledge-create` accepts the retained creation state and clears its journal without changing workspace files or refs. It does not claim the workspace has been repaired.
 
 ## Time Machine
