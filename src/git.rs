@@ -296,8 +296,14 @@ impl Repository {
             None,
         )?)?;
         bytes
-            .split('\0')
-            .filter_map(|s| s.strip_prefix("worktree "))
+            .split("\0\0")
+            .filter_map(|record| {
+                let fields: Vec<_> = record.split('\0').collect();
+                if fields.contains(&"bare") {
+                    return None;
+                }
+                fields.iter().find_map(|s| s.strip_prefix("worktree "))
+            })
             .map(|s| {
                 let path = PathBuf::from(s);
                 match path.canonicalize() {

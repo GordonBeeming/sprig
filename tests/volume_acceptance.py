@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="tool-volume-acceptance-") as base_name:
         image = base / (filesystem.replace("+", "plus") + ".sparseimage")
         mount = base / ("mount-" + filesystem.replace("+", "plus")); mount.mkdir()
         run("hdiutil", "create", "-size", size, "-fs", filesystem, "-type", "SPARSE", "-volname", "ToolDisposable", str(image))
-        attached = run("hdiutil", "attach", "-nobrowse", "-noautoopen", "-mountpoint", str(mount), "-plist", str(image))
+        attached = run("hdiutil", "attach", "-nobrowse", "-noautoopen", "-owners", "on", "-mountpoint", str(mount), "-plist", str(image))
         entities = plistlib.loads(attached.stdout)["system-entities"]
         device = entities[0]["dev-entry"]
         try:
@@ -64,4 +64,12 @@ with tempfile.TemporaryDirectory(prefix="tool-volume-acceptance-") as base_name:
             results.append({"filesystem":filesystem,"wrong_volume_no_mutation":True,"native_enospc_observed":True,"low_space_convert_exit":process.returncode,"target_preserved":True})
         finally:
             run("hdiutil", "detach", device)
+        if filesystem == "APFS":
+            attached = run("hdiutil", "attach", "-nobrowse", "-noautoopen", "-owners", "off", "-mountpoint", str(mount), "-plist", str(image))
+            device = plistlib.loads(attached.stdout)["system-entities"][0]["dev-entry"]
+            try:
+                f.tool("convert", mount / "target", "--dry-run", code=3)
+                results.append({"filesystem":"APFS", "ownership_disabled_rejected":True})
+            finally:
+                run("hdiutil", "detach", device)
 print(json.dumps(results, indent=2))

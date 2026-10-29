@@ -27,6 +27,8 @@ tool doctor ../workspace --json
 
 The first command creates a detached workspace at the source's HEAD. Choose one of `--detach`, `--branch EXISTING` or `--new-branch NAME`; `--branch` cannot accompany `--ref`. New branches start at a resolved commit without changing upstream configuration. Existing destinations and paths overlapping other registered worktrees or Git metadata are rejected.
 
+New workspace roots are private (`0700`). Creation requires parent directories and their ancestors to be owned by the current user or root. Group/world-writable ancestors require sticky-directory protection; allow ACL entries are conservatively rejected. APFS volumes with ownership disabled are unsupported because they cannot enforce these permission safeguards. Reservation identity is checked before Git registration and materialisation; the tool does not follow a substituted destination symlink.
+
 Creation requires a clean source: no staged, unstaged, conflicted or non-ignored untracked files. Ignored files are omitted. The initial dependency/cache policy is `copy.ignored = "none"`; no ignored directories, environment files or credentials are copied. If a target has no reusable files, creation reports `W_NO_SHARED_FILES` and partial success so the absence of sharing is visible.
 
 Creation also screens donor metadata: files with ACLs or xattrs other than the OS-generated `com.apple.provenance` are materialised through Git, so donor-only private metadata is not copied into the new workspace. Conversion instead preserves the existing target's metadata.
@@ -87,6 +89,7 @@ Exclusions affect future Time Machine backups. They do not delete historical bac
 | macOS/APFS | Native clone-or-error, capability probe before mutation |
 | Other filesystems / Linux | Unsupported; no full-copy or hard-link fallback |
 | Ordinary and linked-worktree sources | Supported |
+| Linked worktrees belonging to a bare repository | Supported; the bare repository itself is excluded from donors |
 | SHA-1 and SHA-256 repositories | Supported through Git |
 | UTF-8 spaces, tabs and newlines | NUL-delimited plumbing; supported |
 | Non-UTF-8 paths | Explicit rejection |

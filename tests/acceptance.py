@@ -107,6 +107,47 @@ class Acceptance(unittest.TestCase):
         f.git("worktree", "remove", str(dest))
         self.assertFalse(dest.exists())
 
+    def test_creation_rejects_unsafe_parent_and_changed_reservation(self):
+        f = self.f
+        shared = f.base / "shared"; shared.mkdir(); shared.chmod(0o777)
+        f.tool("create", shared / "unsafe", "--from", f.repo, code=3)
+        self.assertFalse((shared / "unsafe").exists())
+        shared.chmod(0o1777)
+        f.tool("create", shared / "sticky-safe", "--from", f.repo, "--no-time-machine-exclude")
+        self.assertEqual((shared / "sticky-safe").stat().st_mode & 0o777, 0o700)
+        target = f.base / "reserved"; moved = f.base / "moved"; victim = f.base / "victim"; victim.mkdir()
+        ready = f.base / "ready"; release = f.base / "release"
+        env = dict(f.env, TOOL_TEST_FAULTS="1", TOOL_TEST_PAUSE="create_reserved", TOOL_TEST_READY=str(ready), TOOL_TEST_RELEASE=str(release))
+        child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo), "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            target.rename(moved); os.symlink(victim, target)
+            release.write_text("continue")
+            stdout, stderr = child.communicate(timeout=10)
+            self.assertEqual(child.returncode, 4, (stdout, stderr))
+            self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+            self.assertEqual(list(victim.iterdir()), [])
+            self.assertEqual(list(moved.iterdir()), [])
+            f.tool("recover", f.repo, "--acknowledge-create")
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(list(victim.iterdir()), [])
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate()
+
+    def test_linked_worktrees_from_bare_repo_discover_only_checkouts(self):
+        f = self.f; bare = f.base / "bare.git"; donor = f.base / "donor"; target = f.base / "target"
+        f.git("clone", "--bare", str(f.repo), str(bare))
+        f.git("worktree", "add", "--detach", str(donor), f.head, path=bare)
+        f.git("worktree", "add", "--detach", str(target), f.head, path=bare)
+        before = f.state(target)
+        out, _ = f.tool("convert", target, "--no-time-machine-exclude")
+        self.assertGreater(out["data"]["replaced_files"], 0)
+        self.assertEqual(before, f.state(target))
+
     def test_creation_different_commit_and_linked_source(self):
         f = self.f
         old = f.head

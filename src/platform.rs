@@ -340,6 +340,9 @@ mod native {
         if name.to_bytes() != b"apfs" {
             return Err(Error::new("E_UNSUPPORTED", "only macOS/APFS is supported"));
         }
+        if value.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0 {
+            return Err(Error::new("E_UNSUPPORTED", "APFS volumes with ownership disabled cannot enforce workspace permission safeguards"));
+        }
         Ok(())
     }
 }
@@ -407,5 +410,32 @@ pub fn probe(source_dir: &Path, destination_dir: &Path) -> Result<()> {
 }
 pub fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+pub fn validate_workspace_parent(path: &Path) -> Result<()> {
+    let user = unsafe { libc::geteuid() };
+    for directory in path.ancestors() {
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
+            return Err(Error::new(
+                "E_UNSUPPORTED",
+                "destination ancestors must be directories owned by the current user or root",
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
+        }
+        // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
+        if acl(directory)?
+            .lines()
+            .any(|line| !line.is_empty() && !line.starts_with("!#acl") && !line.contains(":deny:"))
+        {
+            return Err(Error::new(
+                "E_UNSUPPORTED",
+                "destination ancestors with allow ACL entries are unsupported",
+            ));
+        }
+    }
     Ok(())
 }

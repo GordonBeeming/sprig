@@ -9,8 +9,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
-    os::unix::fs::MetadataExt,
+    fs::{self, File, OpenOptions},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -40,6 +40,17 @@ struct Candidate {
 fn path_string(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| Error::new("E_UNSUPPORTED", "non-UTF-8 path is unsupported"))
+}
+fn verify_reservation(path: &Path, reservation: &File) -> Result<()> {
+    let current = fs::symlink_metadata(path)?;
+    let pinned = reservation.metadata()?;
+    if !current.is_dir() || (current.dev(), current.ino()) != (pinned.dev(), pinned.ino()) {
+        return Err(Error::new(
+            "E_CHANGED",
+            "reserved destination was replaced; refusing to follow it",
+        ));
+    }
+    Ok(())
 }
 fn probe_at(repo: &Repository, source: &Path, volume: &Path, fallback: &Path) -> Result<()> {
     let dev = fs::metadata(volume)?.dev();
@@ -98,6 +109,7 @@ fn destination(repo: &Repository, path: &Path) -> Result<PathBuf> {
         .unwrap_or(Path::new("."))
         .canonicalize()?;
     let dest = parent.join(name);
+    platform::validate_workspace_parent(&parent)?;
     path_string(&dest)?;
     if fs::symlink_metadata(&dest).is_ok() {
         return Err(Error::new("E_EXISTS", "destination already exists"));
@@ -231,14 +243,19 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
         },
     )?;
     let result = (|| -> Result<Output> {
-        fs::create_dir(&dest)?;
-        let identity = fs::symlink_metadata(&dest)?;
+        fs::DirBuilder::new().mode(0o700).create(&dest)?;
+        let reservation = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&dest)?;
+        let identity = reservation.metadata()?;
         if let Some(ownership) = &mut record.journal.creation {
             ownership.destination_identity = Some((identity.dev(), identity.ino()));
         }
         record.journal.stage = "reserved".into();
         record.save()?;
         state::boundary("create_reserved")?;
+        verify_reservation(&dest, &reservation)?;
         let mut args = vec!["worktree".to_string(), "add".into(), "--no-checkout".into()];
         if let Some(name) = &opts.new_branch {
             args.extend(["-b".into(), name.clone()]);
@@ -252,12 +269,14 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
             target.clone()
         });
         git::run(&repo.root, &args, None)?;
+        verify_reservation(&dest, &reservation)?;
         if let Some(ownership) = &mut record.journal.creation {
             ownership.confirmed_new_branch = opts.new_branch.is_some();
         }
         record.journal.stage = "registered".into();
         record.save()?;
         state::boundary("create_registered")?;
+        verify_reservation(&dest, &reservation)?;
         let workspace = Repository::open(&dest)?;
         git::run(&dest, ["read-tree", &target], None)?;
         let mut remaining = vec![];
@@ -281,6 +300,7 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
         checkout(&dest, attrs.iter().map(|e| e.path.as_str()))?;
         let rendered = git::rendered_hashes(&dest, &entries)?;
         for e in &entries {
+            verify_reservation(&dest, &reservation)?;
             if attr_names.contains(e.path.as_str()) {
                 continue;
             }
@@ -324,6 +344,7 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
             }
             state::boundary("create_seed")?;
         }
+        verify_reservation(&dest, &reservation)?;
         checkout(&dest, remaining.iter().copied())?;
         git::run(&dest, ["update-index", "--refresh"], None)?;
         changed(&snapshot, &repo)?;
