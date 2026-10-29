@@ -76,6 +76,28 @@ pub fn open_regular(path: &Path) -> Result<File> {
     }
     Ok(file)
 }
+
+pub fn preserve_group(path: &Path, gid: u32) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_regular(path)?;
+    // APFS clones inherit the destination directory's group, even when owner copying is enabled.
+    if file.metadata()?.gid() != gid
+        && unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, gid) } != 0
+    {
+        return Err(Error::new(
+            "E_IO",
+            format!(
+                "could not preserve clone group for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ),
+        )
+        .with_data(serde_json::json!({"path": path, "field": "gid", "expected": gid})));
+    }
+    Ok(())
+}
+
 pub fn fingerprint(path: &Path) -> Result<Fingerprint> {
     let mut file = open_regular(path)?;
     let before = file.metadata()?;
