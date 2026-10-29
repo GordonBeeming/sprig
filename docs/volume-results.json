@@ -1,0 +1,13 @@
+[
+  {
+    "filesystem": "APFS",
+    "wrong_volume_no_mutation": true,
+    "native_enospc_observed": true,
+    "low_space_convert_exit": 5,
+    "target_preserved": true
+  },
+  {
+    "filesystem": "HFS+",
+    "unsupported_no_mutation": true
+  }
+]

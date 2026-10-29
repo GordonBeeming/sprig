@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+      - name: Verify
+        run: |
+          set -euo pipefail
+          cargo +1.89.0 fmt --all -- --check
+          cargo +1.89.0 clippy --locked --all-targets -- -D warnings
+          cargo +1.89.0 test --locked
+          cargo +1.89.0 build --locked --release

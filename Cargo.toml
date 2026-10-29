@@ -1,0 +1,22 @@
+[package]
+name = "sprig"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast, space-efficient Git worktrees using copy-on-write. Create independent development workspaces that share storage until files change."
+license-file = "LICENSE"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1.8"
+tempfile = "3"
+toml = "0.8"
+xattr = "1"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+

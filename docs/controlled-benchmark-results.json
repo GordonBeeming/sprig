@@ -1,0 +1,104 @@
+{
+  "recorded_at_utc": "2026-10-29T06:22:20.464807+00:00",
+  "git": "git version 2.56.0",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B123\n",
+  "filesystem": "APFS (native tests and clonefile success)",
+  "binary": "/Users/gordonbeeming/Developer/github/gordonbeeming/sprig/.codex/worktrees/20261028-keen-fantail/target/release/sprig",
+  "binary_sha256": "c29e84fadd26392725176b132e10ce3cfbcab6a806215e198d0535ef06e85043",
+  "payload_files": 16,
+  "payload_mib_per_file": 8,
+  "logical_worktree_bytes": 134219176,
+  "trials": [
+    {
+      "trial": 1,
+      "background_control": {
+        "elapsed_seconds": 0.25114004100032616,
+        "volume_used_delta_bytes": 0
+      },
+      "ordinary_create": {
+        "elapsed_seconds": 0.13727858300262596,
+        "volume_used_delta_bytes": 134279168
+      },
+      "cow_create": {
+        "elapsed_seconds": 1.4197664160019485,
+        "volume_used_delta_bytes": 45056
+      },
+      "convert": {
+        "elapsed_seconds": 5.157074333008495,
+        "volume_used_delta_bytes": -134230016
+      },
+      "private_write": {
+        "elapsed_seconds": 0.05952829199668486,
+        "volume_used_delta_bytes": 8388608
+      },
+      "cloned_files": 20,
+      "converted_files": 20,
+      "target_st_blocks_bytes_including_shared": 134242304
+    },
+    {
+      "trial": 2,
+      "background_control": {
+        "elapsed_seconds": 0.2530724160023965,
+        "volume_used_delta_bytes": 0
+      },
+      "ordinary_create": {
+        "elapsed_seconds": 0.09459429200796876,
+        "volume_used_delta_bytes": 134287360
+      },
+      "cow_create": {
+        "elapsed_seconds": 1.1885428329987917,
+        "volume_used_delta_bytes": 40960
+      },
+      "convert": {
+        "elapsed_seconds": 4.71609937500034,
+        "volume_used_delta_bytes": -134234112
+      },
+      "private_write": {
+        "elapsed_seconds": 0.05389374999504071,
+        "volume_used_delta_bytes": 8388608
+      },
+      "cloned_files": 20,
+      "converted_files": 20,
+      "target_st_blocks_bytes_including_shared": 134242304
+    },
+    {
+      "trial": 3,
+      "background_control": {
+        "elapsed_seconds": 0.25502125000639353,
+        "volume_used_delta_bytes": 0
+      },
+      "ordinary_create": {
+        "elapsed_seconds": 0.10501812500297092,
+        "volume_used_delta_bytes": 134275072
+      },
+      "cow_create": {
+        "elapsed_seconds": 1.001043917000061,
+        "volume_used_delta_bytes": 45056
+      },
+      "convert": {
+        "elapsed_seconds": 4.562788000010187,
+        "volume_used_delta_bytes": -134238208
+      },
+      "private_write": {
+        "elapsed_seconds": 0.04770691698649898,
+        "volume_used_delta_bytes": 8392704
+      },
+      "cloned_files": 20,
+      "converted_files": 20,
+      "target_st_blocks_bytes_including_shared": 134242304
+    }
+  ],
+  "median_seconds": {
+    "ordinary_create": 0.10501812500297092,
+    "cow_create": 1.1885428329987917,
+    "convert": 4.71609937500034
+  },
+  "limitations": [
+    "volume-wide accounting includes concurrent applications and APFS metadata",
+    "snapshots can retain old allocation after conversion",
+    "clone group IDs and clonefile prove native sharing semantics, not exact per-directory exclusive extent ownership",
+    "st_blocks includes shared blocks and must not be summed into claimed physical savings",
+    "global sync is outside measured command duration",
+    "fresh random payload; warm object cache; no claim about cold or small-file workloads"
+  ]
+}

@@ -1,0 +1,130 @@
+name: Release and Homebrew
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sprig-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
+    steps:
+      - name: Check out the requested tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and source version
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, tomllib
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+              raise SystemExit("Only stable vMAJOR.MINOR.PATCH tags are supported")
+          with open("Cargo.toml", "rb") as source:
+              version = tomllib.load(source)["package"]["version"]
+          if tag != "v" + version:
+              raise SystemExit("Tag does not match Cargo.toml")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"VERSION={version}\n")
+          PY
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          test "$(uname -m)" = arm64
+      - name: Install Rust
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+      - name: Verify and build
+        run: |
+          set -euo pipefail
+          cargo +1.89.0 fmt --all -- --check
+          cargo +1.89.0 clippy --locked --all-targets -- -D warnings
+          cargo +1.89.0 test --locked
+          cargo +1.89.0 build --locked --release --target aarch64-apple-darwin
+      - name: Package and validate
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage
+          cp target/aarch64-apple-darwin/release/sprig dist/stage/sprig
+          cp LICENSE dist/stage/LICENSE
+          cp scripts/adopt-worktrees.py dist/stage/adopt-worktrees.py
+          codesign --force --sign - dist/stage/sprig
+          codesign --verify --strict dist/stage/sprig
+          dist/stage/sprig --version
+          dist/stage/sprig capabilities --json
+          tar -czf "dist/sprig-$VERSION-aarch64-apple-darwin.tar.gz" -C dist/stage sprig LICENSE adopt-worktrees.py
+          python3 packaging/homebrew/formula.py "$VERSION" "dist/sprig-$VERSION-aarch64-apple-darwin.tar.gz" dist/sprig.rb
+          ruby -c dist/sprig.rb
+          cd dist
+          shasum -a 256 "sprig-$VERSION-aarch64-apple-darwin.tar.gz" > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: homebrew-release
+          path: |
+            dist/*.tar.gz
+            dist/sprig.rb
+            dist/SHA256SUMS
+
+  publish:
+    needs: package
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: homebrew-release
+          path: dist
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 --check SHA256SUMS
+          marker="sprig-homebrew-v1:$(shasum -a 256 SHA256SUMS | awk '{print $1}')"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,body > release-state.json
+            if python3 -c 'import json,sys; r=json.load(open("release-state.json")); sys.exit(0 if r["isDraft"] and sys.argv[1] in r["body"] else 1)' "$marker"; then
+              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.tar.gz SHA256SUMS sprig.rb
+            fi
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes --notes "$marker"
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" ./*.tar.gz SHA256SUMS sprig.rb
+          fi
+          # Verify the complete hosted payload before making a draft public or touching the tap.
+            mkdir existing
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir existing
+            cmp SHA256SUMS existing/SHA256SUMS
+            cmp sprig.rb existing/sprig.rb
+            cmp "sprig-${RELEASE_TAG#v}-aarch64-apple-darwin.tar.gz" "existing/sprig-${RELEASE_TAG#v}-aarch64-apple-darwin.tar.gz"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+      - name: Update the Homebrew tap with a signed commit
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          COMMIT_SIGNING_KEY: ${{ secrets.COMMIT_SIGNING_KEY }}
+        run: VERSION="${RELEASE_TAG#v}" bash packaging/homebrew/publish-tap.sh "$PWD/dist/sprig.rb"
