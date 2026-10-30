@@ -41,17 +41,53 @@ impl Fingerprint {
             && self.birth == other.birth
             && self.flags == other.flags
             && self.digest == other.digest
-            && self.xattrs == other.xattrs
+            && self.preserved_xattrs().eq(other.preserved_xattrs())
             && self.acl == other.acl
     }
     pub fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
     }
     pub fn unchanged(&self, other: &Self) -> bool {
-        self.identity() == other.identity() && self.ctime == other.ctime && self.equivalent(other)
+        self.identity() == other.identity()
+            && self.ctime == other.ctime
+            && self.xattrs == other.xattrs
+            && self.equivalent(other)
     }
     pub fn preserves(&self, other: &Self) -> bool {
         self.equivalent(other) && self.atime == other.atime
+    }
+
+    fn preserved_xattrs(&self) -> impl Iterator<Item = (&String, &String)> {
+        // The kernel may assign new provenance to a clone; it cannot be restored by the process.
+        // Keep it in the fingerprint so same-file mutation checks remain strict.
+        self.xattrs
+            .iter()
+            .filter(|(name, _)| name.as_str() != "com.apple.provenance")
+    }
+
+    pub fn preservation_differences(&self, other: &Self) -> BTreeMap<String, serde_json::Value> {
+        let mut differences = BTreeMap::new();
+        macro_rules! fields {
+            ($($field:ident),+ $(,)?) => {$(
+                if self.$field != other.$field {
+                    differences.insert(stringify!($field).into(), serde_json::json!({
+                        "expected": self.$field, "observed": other.$field
+                    }));
+                }
+            )+};
+        }
+        fields!(len, mode, uid, gid, mtime, atime, birth, flags, digest, acl);
+        for name in self.xattrs.keys().chain(other.xattrs.keys()) {
+            if name != "com.apple.provenance" && self.xattrs.get(name) != other.xattrs.get(name) {
+                differences.insert(
+                    format!("xattr {name}"),
+                    serde_json::json!({
+                        "expected": self.xattrs.get(name), "observed": other.xattrs.get(name)
+                    }),
+                );
+            }
+        }
+        differences
     }
 }
 pub fn open_regular(path: &Path) -> Result<File> {

@@ -40,3 +40,52 @@ fn real_apfs_metadata_and_swap() -> Result<()> {
     assert_eq!(fs::read(&temp)?, b"identical contents");
     Ok(())
 }
+
+#[test]
+fn clone_verification_allows_system_provenance_to_change() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("file");
+    fs::write(&path, b"unchanged tracked contents")?;
+    let mut source = platform::fingerprint(&path)?;
+    let mut clone = source.clone();
+    source.xattrs.insert(
+        "com.apple.provenance".into(),
+        "010200A6E5DFAA4D6AF172".into(),
+    );
+    clone.xattrs.insert(
+        "com.apple.provenance".into(),
+        "010200B3290DAE49F14B0C".into(),
+    );
+    assert!(
+        source.preserves(&clone),
+        "OS provenance must not reject otherwise preserved clone metadata"
+    );
+    assert!(source.preservation_differences(&clone).is_empty());
+    assert!(
+        !source.unchanged(&clone),
+        "source mutation detection must still compare provenance"
+    );
+    clone.xattrs.remove("com.apple.provenance");
+    assert!(
+        source.preserves(&clone),
+        "OS provenance may also be absent on a clone"
+    );
+    clone.xattrs.insert(
+        "com.apple.quarantine".into(),
+        "quarantine remains protected".into(),
+    );
+    assert!(
+        !source.preserves(&clone),
+        "other xattrs must remain protected"
+    );
+    assert!(source
+        .preservation_differences(&clone)
+        .contains_key("xattr com.apple.quarantine"));
+    clone.xattrs.remove("com.apple.quarantine");
+    clone.digest = "different bytes".into();
+    assert!(
+        !source.preserves(&clone),
+        "provenance policy must not mask changed contents"
+    );
+    Ok(())
+}
