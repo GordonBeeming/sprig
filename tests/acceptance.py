@@ -519,24 +519,41 @@ class Acceptance(unittest.TestCase):
         self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
 
     def test_lf_text_attributes_do_not_spawn_per_file_filter_processes(self):
-        f = self.f
-        f.write(".gitattributes", b"* text=auto\n")
-        f.commit()
-        trace = f.base / "git-trace.json"
-        env = dict(f.env, GIT_TRACE2_EVENT=str(trace))
-        target = f.base / "lf-text"
-        out, _ = f.sprig("create", target, "--from", f.repo, "--no-time-machine-exclude", env=env)
-        self.assertGreater(out["data"]["cloned_files"], 0)
-        self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
-        events = [json.loads(line) for line in trace.read_text().splitlines()]
-        filters = [event for event in events if event.get("event") == "start"
-                   and "cat-file" in event.get("argv", []) and "--filters" in event.get("argv", [])]
-        self.assertEqual(filters, [], "LF-only text checkouts must use the batched object hashes")
+        cases = [
+            (b"* text=auto\n", {}),
+            (b"* text=auto\n", {"core.autocrlf": "input", "core.eol": "crlf"}),
+            (b"", {"core.eol": "crlf"}),
+            (b"* -text\n", {"core.eol": "crlf"}),
+            (b"* -text crlf\n", {"core.eol": "crlf"}),
+            (b"* text=input crlf\n", {"core.eol": "crlf"}),
+            (b"* crlf=input\n", {"core.eol": "crlf"}),
+        ]
+        for i, (attributes, config) in enumerate(cases):
+            with self.subTest(attributes=attributes, config=config):
+                base = self.f.base / ("lf-case-" + str(i))
+                base.mkdir()
+                f = Fixture(base)
+                for key, value in config.items():
+                    f.git("config", key, value)
+                f.write(".gitattributes", attributes)
+                f.commit()
+                trace = f.base / "git-trace.json"
+                env = dict(f.env, GIT_TRACE2_EVENT=str(trace))
+                target = f.base / "lf-text"
+                out, _ = f.sprig("create", target, "--from", f.repo, "--no-time-machine-exclude", env=env)
+                self.assertGreater(out["data"]["cloned_files"], 0)
+                self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
+                events = [json.loads(line) for line in trace.read_text().splitlines()]
+                filters = [event for event in events if event.get("event") == "start"
+                           and "cat-file" in event.get("argv", []) and "--filters" in event.get("argv", [])]
+                self.assertEqual(len(filters), 0, "LF-only checkouts must use the batched object hashes")
 
     def test_checkout_filter_selection_matches_git(self):
         cases = [
             (b"* text=auto\n", {"core.eol": "crlf"}),
             (b"* text eol=crlf\n", {}),
+            (b"* text eol=crlf\n", {"core.autocrlf": "input", "core.eol": "lf"}),
+            (b"* crlf\n", {"core.eol": "crlf"}),
             (b"* text eol=lf\n", {"core.autocrlf": "true", "core.eol": "crlf"}),
             (b"* text=auto ident\n", {}),
             (b"* -text\n", {"core.autocrlf": "true"}),
