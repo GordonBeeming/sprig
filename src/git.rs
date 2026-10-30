@@ -162,10 +162,21 @@ pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String
         ["check-attr", "-z", "--stdin", "text", "eol", "ident"],
         Some(&input),
     )?)?;
-    let mut transformed = BTreeSet::new();
+    let mut ident = BTreeSet::new();
+    let mut crlf = BTreeSet::new();
+    let mut lf = BTreeSet::new();
     for fields in attrs.split('\0').collect::<Vec<_>>().chunks_exact(3) {
-        if !["unspecified", "unset"].contains(&fields[2]) {
-            transformed.insert(fields[0].to_string());
+        match (fields[1], fields[2]) {
+            ("ident", value) if !["unspecified", "unset"].contains(&value) => {
+                ident.insert(fields[0].to_string());
+            }
+            ("eol", "lf") => {
+                lf.insert(fields[0].to_string());
+            }
+            ("eol", value) if !["unspecified", "unset"].contains(&value) => {
+                crlf.insert(fields[0].to_string());
+            }
+            _ => {}
         }
     }
     let autocrlf = match line(root, &["config", "--get", "core.autocrlf"]) {
@@ -177,8 +188,18 @@ pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String
         Err(e) if e.data["git_exit_code"] == 1 => false,
         Err(e) => return Err(e),
     };
+    let core_crlf = match line(root, &["config", "--get", "core.eol"]) {
+        Ok(value) => !["lf", "native"].contains(&value.to_ascii_lowercase().as_str()),
+        Err(e) if e.data["git_exit_code"] == 1 => false,
+        Err(e) => return Err(e),
+    };
     for entry in entries {
-        if hashes.contains_key(&entry.path) && (transformed.contains(&entry.path) || autocrlf) {
+        // Checkout's text conversion only expands LF to CRLF. LF-only checkouts need no
+        // per-file filter process; ident and every possible CRLF case still go through Git.
+        let filtered = ident.contains(&entry.path)
+            || crlf.contains(&entry.path)
+            || ((autocrlf || core_crlf) && !lf.contains(&entry.path));
+        if hashes.contains_key(&entry.path) && filtered {
             // Batch headers describe object size, which can differ from the filtered byte count.
             let bytes = run(
                 root,

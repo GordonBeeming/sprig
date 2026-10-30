@@ -126,6 +126,8 @@ Exclusions affect future Time Machine backups. They do not delete historical bac
 | Modified or staged target files | Preserved and skipped |
 | Dry-run | Reads only; no probe, lock creation, receipts, Git changes or exclusions |
 
+Clone and replacement verification ignores only the kernel-managed `com.apple.provenance` attribute, whose value macOS can reassign. Other extended attributes, including quarantine, remain protected. Same-file change detection still compares every recorded extended attribute.
+
 Replacement changes inode and ctime; parent directory timestamps may change. File mtime, birth time, atime, ownership, mode, ACLs and xattrs are checked separately. Filesystem reads can affect access-time bookkeeping on other mounts; no no-atime guarantee is made beyond tested APFS behaviour. Process-interruption tests do not establish power-loss durability. CoW saves initial storage, but later writes still require free space and can fail ENOSPC.
 
 Status receipts report historical operation counts, not current exclusive storage savings. Clone-group skips are advisory because files in a clone family may have diverged extents. Logical bytes and summed `st_blocks` are not proof of physical savings. The current verified implementation prioritises preservation and is slower than ordinary warm-cache Git checkout in the measured workload.

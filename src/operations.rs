@@ -328,10 +328,12 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
                         state::boundary("create_cloned")?;
                         let after = platform::fingerprint(&target_path)?;
                         if !before.preserves(&after) {
+                            let differences = before.preservation_differences(&after);
+                            let fields = differences.keys().cloned().collect::<Vec<_>>().join(", ");
                             return Err(Error::new(
                                 "E_CHANGED",
-                                format!("clone metadata/bytes did not match source: {}", target_path.display()),
-                            ).with_data(json!({"path":target_path,"source":donor,"kind":"clone_preservation","expected":before,"observed":after})));
+                                format!("clone metadata/bytes did not match source ({fields}): {}", target_path.display()),
+                            ).with_data(json!({"path":target_path,"source":donor,"kind":"clone_preservation","expected":before,"observed":after,"differences":differences})));
                         }
                         let donor_after = platform::fingerprint(&donor)?;
                         if !donor_after.unchanged(&before) {
