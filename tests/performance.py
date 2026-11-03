@@ -30,6 +30,19 @@ def positive(value):
     return number
 
 
+def run_bounded(command, env, timeout):
+    process = subprocess.Popen(list(map(str, command)), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True, env=env)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        timed_out = True
+    return process, stdout, stderr, timed_out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -82,16 +95,8 @@ def main():
             before = os.statvfs(base)
             load_before = os.getloadavg()
             started = time.perf_counter()
-            process = subprocess.Popen(list(map(str, command)), stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True,
-                                       env=dict(env, GIT_TRACE2_EVENT=str(trace)) if args.trace else env)
-            try:
-                stdout, stderr = process.communicate(timeout=args.timeout)
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout, stderr = process.communicate()
-                timed_out = True
+            process, stdout, stderr, timed_out = run_bounded(
+                command, dict(env, GIT_TRACE2_EVENT=str(trace)) if args.trace else env, args.timeout)
             elapsed = time.perf_counter() - started
             after = os.statvfs(base)
             row = {"seconds": elapsed, "exit_code": process.returncode, "timed_out": timed_out,
@@ -134,16 +139,16 @@ def main():
             # A hook-created file or Git-materialised attribute file is not proof
             # of CoW isolation. Ask the native planner which tracked paths still
             # share a clone group with this donor before choosing the write.
-            sharing = subprocess.run([str(binary), "--json", "convert", str(cow),
-                                     "--source", str(repo), "--dry-run", "--no-time-machine-exclude"],
-                                    env=env, capture_output=True)
-            rows["sharing_verification"] = {"exit_code": sharing.returncode}
+            sharing, sharing_stdout, sharing_stderr, sharing_timeout = run_bounded(
+                [binary, "--json", "convert", cow, "--source", repo, "--dry-run", "--no-time-machine-exclude"],
+                env, args.timeout)
+            rows["sharing_verification"] = {"exit_code": sharing.returncode, "timed_out": sharing_timeout}
             shared = set()
             if sharing.returncode:
-                rows["sharing_verification"]["stderr_tail"] = sharing.stderr.decode(errors="replace")[-2000:]
+                rows["sharing_verification"]["stderr_tail"] = sharing_stderr.decode(errors="replace")[-2000:]
             else:
                 try:
-                    shared = {entry["path"] for entry in json.loads(sharing.stdout)["data"]["files"]
+                    shared = {entry["path"] for entry in json.loads(sharing_stdout)["data"]["files"]
                               if entry["reason"] == "same_clone_group"}
                 except (ValueError, KeyError, TypeError) as error:
                     rows["sharing_verification"]["error"] = str(error)

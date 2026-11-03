@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from acceptance import BINARY, Fixture
+from performance import run_bounded
 
 
 class PerformanceHarness(unittest.TestCase):
@@ -92,6 +93,18 @@ class PerformanceHarness(unittest.TestCase):
         self.assertIsNone(trial["private_write"])
         self.assertEqual(trial["sharing_verification"]["exit_code"], 5)
         self.assertIn("injected sharing probe failure", trial["sharing_verification"]["stderr_tail"])
+
+    def test_timeout_stops_the_whole_subprocess_group(self):
+        pid_file = self.f.base / "child-pid"
+        script = ("import subprocess,time; from pathlib import Path; "
+                  "child=subprocess.Popen(['sleep','60']); "
+                  f"Path({str(pid_file)!r}).write_text(str(child.pid)); time.sleep(60)")
+        process, _, _, timed_out = run_bounded([sys.executable, "-c", script], self.f.env, 1)
+        self.assertTrue(timed_out)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertTrue(pid_file.exists())
+        child = subprocess.run(["ps", "-p", pid_file.read_text(), "-o", "stat="], capture_output=True)
+        self.assertTrue(not child.stdout.strip() or child.stdout.strip().startswith(b"Z"), child.stdout)
 
 
 if __name__ == "__main__":
