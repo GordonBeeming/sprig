@@ -524,6 +524,12 @@ pub(crate) fn sync_pending(file: &File) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn has_granting_acl(path: &Path) -> Result<bool> {
+    Ok(acl(path)?
+        .lines()
+        .any(|line| !line.is_empty() && !line.starts_with("!#acl") && !line.contains(":deny:")))
+}
+
 pub fn validate_workspace_parent(path: &Path) -> Result<()> {
     let user = unsafe { libc::geteuid() };
     for directory in path.ancestors() {
@@ -539,10 +545,7 @@ pub fn validate_workspace_parent(path: &Path) -> Result<()> {
             return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
         }
         // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
-        if acl(directory)?
-            .lines()
-            .any(|line| !line.is_empty() && !line.starts_with("!#acl") && !line.contains(":deny:"))
-        {
+        if has_granting_acl(directory)? {
             return Err(Error::new(
                 "E_UNSUPPORTED",
                 "destination ancestors with allow ACL entries are unsupported",

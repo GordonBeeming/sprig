@@ -71,7 +71,9 @@ sprig recover ../workspace --json
 
 Recovery verifies file identities and contents before removing a known sibling. It retains changed or unknown files for manual resolution. Owned-directory journals can recover an uncheckpointed copy after verifying that the original is unchanged and the copy matches its expected bytes and metadata. Legacy journals without that ownership proof retain uncheckpointed siblings for inspection. Neither recovery nor normal cleanup prunes unrelated Git registrations or deletes branches.
 
-If an entry proves no swap occurred and its sibling is already absent, later user edits or deletion of the target do not block cleanup of that entry. The batch journal remains until its entries and owned directory are resolved.
+When an owned sibling is already absent, recovery leaves that entry's target untouched, including later edits or deletion. This makes retries safe after partial cleanup or an earlier recovery attempt. The batch journal remains until its entries and owned directory are resolved. Owned clone directories and their parents cannot have granting ACLs; validation also checks for ACL changes during conversion.
+
+Creation validates the destination index even when every file is materialised by Git. A busy index lock, unsupported index flags or a concurrent index change stops creation and retains the workspace for inspection.
 
 Interrupted creation retains its directory, any branch/registration and its journal. Inspect HEAD, index and local files first. Locate the worktree index lock with `git rev-parse --git-path index.lock`; remove a stale lock only after confirming Git has stopped. A registered directory with no index needs `git read-tree HEAD` only after checking that no user index state needs saving; `git checkout-index --all` can restore missing paths without `--force`. `sprig recover <repository> --acknowledge-create` accepts the retained creation state and clears its journal without changing workspace files or refs. It does not claim the workspace has been repaired.
 

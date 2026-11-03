@@ -2,7 +2,10 @@
 
 Example: python3 tests/performance.py --source /path/to/SSW.Rules.Content \
     --output /tmp/sprig-performance.json --timeout 30
-Exit 1 means a Sprig command failed, timed out, or exceeded the time budget.
+Exit 1 means a measured command failed or timed out, a Sprig command exceeded
+the budget, or validation failed: wrong clone/replacement counts, metadata skips,
+no tracked regular file of at least 8 MiB with verified sharing, or a changed donor.
+Git's elapsed time is exempt from the Sprig budget; its exit status is checked.
 Volume-wide allocation observations are diagnostic, not per-worktree savings.
 """
 import argparse
@@ -42,7 +45,11 @@ def main():
         parser.error("--repeats must be positive")
     binary = args.binary.resolve(strict=True)
     source = args.source.resolve(strict=True)
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    # Keep the caller's chosen global configuration, but never inherit a Git
+    # command's repository, namespace, index or injected per-command context.
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") or key == "GIT_CONFIG_GLOBAL"}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
 
     def git(*arguments):
         return subprocess.check_output(
@@ -51,9 +58,11 @@ def main():
 
     commit = git("-C", source, "rev-parse", "HEAD")
     report = {
+        "protocol_version": 2,
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_commit": commit,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "binary_version": subprocess.check_output([str(binary), "--version"], env=env).decode().strip(),
         "platform": platform.platform(), "git": git("--version"),
         "budget_seconds": args.budget, "timeout_seconds": args.timeout,
         "traced": args.trace,
@@ -63,6 +72,7 @@ def main():
             "Volume-wide free-space changes include other applications and snapshots; not exclusive savings.",
             "Time Machine exclusion is disabled; its status query remains part of command time.",
             "Timing includes Git Trace2 overhead only when --trace is set.",
+            "An untimed native conversion plan verifies sharing before the private write.",
         ], "trials": [],
     }
     with tempfile.TemporaryDirectory(prefix="sprig-performance-", dir=args.root) as base:
@@ -121,8 +131,29 @@ def main():
             rows["create"] = measure("create", [binary, "--json", "create", cow, "--from", repo,
                                                "--no-time-machine-exclude"], trial)
             rows["status"] = measure("status", [binary, "--json", "status", cow], trial)
-            payload = next((path for path in sorted(cow.rglob("*")) if path.is_file()
-                            and not path.is_symlink() and path.stat().st_size >= 8 * 1024 * 1024), None)
+            # A hook-created file or Git-materialised attribute file is not proof
+            # of CoW isolation. Ask the native planner which tracked paths still
+            # share a clone group with this donor before choosing the write.
+            sharing = subprocess.run([str(binary), "--json", "convert", str(cow),
+                                     "--source", str(repo), "--dry-run", "--no-time-machine-exclude"],
+                                    env=env, capture_output=True)
+            rows["sharing_verification"] = {"exit_code": sharing.returncode}
+            shared = set()
+            if sharing.returncode:
+                rows["sharing_verification"]["stderr_tail"] = sharing.stderr.decode(errors="replace")[-2000:]
+            else:
+                try:
+                    shared = {entry["path"] for entry in json.loads(sharing.stdout)["data"]["files"]
+                              if entry["reason"] == "same_clone_group"}
+                except (ValueError, KeyError, TypeError) as error:
+                    rows["sharing_verification"]["error"] = str(error)
+            rows["sharing_verification"]["shared_files"] = len(shared)
+            payload = next((cow / name for name in sorted(regular)
+                            if name in shared and Path(name).name != ".gitattributes"
+                            and not (cow / name).is_symlink()
+                            and (cow / name).resolve().is_relative_to(cow.resolve())
+                            and (cow / name).is_file()
+                            and (cow / name).stat().st_size >= 8 * 1024 * 1024), None)
             rows["private_write"] = None
             if payload is not None:
                 donor = repo / payload.relative_to(cow)
@@ -140,6 +171,8 @@ def main():
                     "seconds": elapsed, "written_bytes": len(data),
                     "volume_used_delta_bytes": (before.f_bfree - after.f_bfree) * after.f_frsize,
                     "donor_unchanged": hashlib.sha256(donor.read_bytes()).hexdigest() == donor_before,
+                    "sharing_verified_by": "native convert plan: same_clone_group",
+                    "tracked_path": str(payload.relative_to(cow)),
                 }
             rows["git_create"] = measure("git_create", ["git", "-C", repo, "worktree", "add",
                                                        "--detach", ordinary, commit], trial)
@@ -159,8 +192,8 @@ def main():
                                       else statistics.median(row[name]["seconds"] for row in report["trials"]))
                                 for name in names}
     report["passed"] = len(report["trials"]) == args.repeats and all(
-        row[name]["exit_code"] == 0 and row[name]["seconds"] <= args.budget
-        for row in report["trials"] for name in names if name != "git_create")
+        row[name]["exit_code"] == 0 and (name == "git_create" or row[name]["seconds"] <= args.budget)
+        for row in report["trials"] for name in names)
     report["passed"] = report["passed"] and all(
         row["create"].get("result", {}).get("cloned_files") == report["expected_cloned_files"]
         and row["convert"].get("result", {}).get("replaced_files") == report["expected_converted_files"]

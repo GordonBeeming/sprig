@@ -700,6 +700,70 @@ class Acceptance(unittest.TestCase):
         self.assertLessEqual(large_count, small_count, "Git subprocess count must not grow per converted file")
         self.assertLess(large_count, 80)
 
+    def test_clone_directory_rejects_inherited_and_later_granting_acls(self):
+        f = self.f
+        target = f.ordinary("inherited")
+        before = f.state(target)
+        run("chmod", "+a", "everyone allow add_file,delete_child,file_inherit,directory_inherit", str(target))
+        out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+        self.assertEqual(out["code"], "E_UNSUPPORTED")
+        self.assertEqual(before, f.state(target))
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+        run("chmod", "-N", str(target))
+        target = f.ordinary("later-acl")
+        ready, release = f.base / "acl-ready", f.base / "acl-release"
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="convert_reserved",
+                   SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+        child = subprocess.Popen([BINARY, "--json", "convert", str(target), "--source", str(f.repo),
+                                  "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            directory = next(target.glob(".tool-clones-*"))
+            run("chmod", "+a", "everyone allow add_file,delete_child", str(directory))
+            release.write_text("continue")
+            stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+            self.assertEqual(child.returncode, 4, (stdout, stderr))
+            self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+            self.assertTrue(directory.exists())
+            run("chmod", "-N", str(directory))
+            f.sprig("recover", target)
+            self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
+            self.assertFalse(directory.exists())
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate()
+
+    def test_recovery_retry_leaves_already_resolved_targets_untouched(self):
+        f = self.f
+        for edit in ["changed", "deleted"]:
+            with self.subTest(edit=edit):
+                target = f.ordinary(edit)
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_prepared")
+                result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                             "--no-time-machine-exclude", env=env, check=False)
+                self.assertEqual(result.returncode, 91)
+                journals = f.journal_data()
+                resolved, blocked = journals[0], journals[1]
+                run("xattr", "-w", "test.recovery", "hold", blocked["target"])
+                f.sprig("recover", target, code=5)
+                self.assertFalse(Path(resolved["sibling"]).exists())
+                path = Path(resolved["target"])
+                if edit == "changed":
+                    path.write_bytes(b"user edit between recovery attempts")
+                else:
+                    path.unlink()
+                run("xattr", "-d", "test.recovery", blocked["target"])
+                f.sprig("recover", target)
+                if edit == "changed":
+                    self.assertEqual(path.read_bytes(), b"user edit between recovery attempts")
+                else:
+                    self.assertFalse(path.exists())
+                self.assertFalse(f.journal_data())
+                self.assertFalse(list(target.glob(".tool-clones-*")))
+
     def test_grouped_conversion_recovery_and_multiple_batches(self):
         f = self.f
         for i in range(1500):
@@ -851,6 +915,76 @@ class Acceptance(unittest.TestCase):
                     if action == "stage":
                         self.assertEqual((target / "user-added").read_bytes(), b"keep my staged work")
                         self.assertIn(b"user-added", f.git("diff", "--cached", "--name-only", path=target))
+                    f.sprig("recover", f.repo, "--acknowledge-create")
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.communicate()
+
+    def test_index_publication_preserves_uncooperative_edits(self):
+        f = self.f
+        for point in ["index_after_read", "index_before_publish"]:
+            for action in ["truncate", "mmap", "replace"]:
+                with self.subTest(point=point, action=action):
+                    name = point + action
+                    target = f.base / name
+                    ready, release = f.base / (name + "-ready"), f.base / (name + "-release")
+                    env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE=point,
+                               SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                    child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                              "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not ready.exists() and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue(ready.exists())
+                        admin = Path(f.git("rev-parse", "--absolute-git-dir", path=target).decode().strip())
+                        self.assertTrue((admin / "index.lock").exists())
+                        index = admin / "index"
+                        if action == "truncate":
+                            index.write_bytes(b"")
+                        elif action == "replace":
+                            other = admin / "external-index"
+                            other.write_bytes(index.read_bytes())
+                            other.replace(index)
+                        else:
+                            with index.open("r+b") as file, mmap.mmap(file.fileno(), 0) as mapping:
+                                mapping[-1] ^= 1
+                        expected = index.read_bytes()
+                        release.write_text("continue")
+                        stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                        self.assertEqual(child.returncode, 4, (stdout, stderr))
+                        self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                        self.assertEqual(index.read_bytes(), expected)
+                        self.assertFalse((admin / "index.lock").exists())
+                        f.sprig("recover", f.repo, "--acknowledge-create")
+                    finally:
+                        if child.poll() is None:
+                            child.kill(); child.communicate()
+
+    def test_index_flags_are_checked_without_clones(self):
+        f = self.f
+        f.git("config", "core.autocrlf", "true")
+        for flag in ["--skip-worktree", "--assume-unchanged"]:
+            with self.subTest(flag=flag):
+                target = f.base / flag.lstrip("-")
+                ready, release = f.base / (target.name + "-ready"), f.base / (target.name + "-release")
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="create_before_index",
+                           SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                          "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    f.git("update-index", flag, "a", path=target)
+                    index = Path(f.git("rev-parse", "--absolute-git-dir", path=target).decode().strip()) / "index"
+                    expected = index.read_bytes()
+                    release.write_text("continue")
+                    stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                    self.assertEqual(child.returncode, 4, (stdout, stderr))
+                    self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                    self.assertEqual(index.read_bytes(), expected)
                     f.sprig("recover", f.repo, "--acknowledge-create")
                 finally:
                     if child.poll() is None:

@@ -25,7 +25,11 @@ fn private_dir(path: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     let m = fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
+    if !m.is_dir()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.mode() & 0o022 != 0
+        || platform::has_granting_acl(path)?
+    {
         return Err(Error::new(
             "E_STATE",
             "Sprig state directory has unsafe type, owner or permissions",
@@ -90,18 +94,29 @@ pub struct CloneDirectory {
 }
 impl CloneDirectory {
     pub(crate) fn new(root: &Path) -> Result<Self> {
+        if platform::has_granting_acl(root)? {
+            return Err(Error::new(
+                "E_UNSUPPORTED",
+                "clone-directory parent has a granting ACL",
+            ));
+        }
         let dir = tempfile::Builder::new()
             .prefix(".tool-clones-")
             .tempdir_in(root)?;
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let m = fs::symlink_metadata(dir.path())?;
-        platform::sync_dir(dir.path())?;
-        platform::sync_dir(root)?;
-        Ok(Self {
+        let directory = Self {
             path: dir.keep(),
             identity: (m.dev(), m.ino()),
             gid: m.gid(),
-        })
+        };
+        directory.validate(root).map_err(|e| {
+            Error::new(e.code, e.message)
+                .with_data(serde_json::json!({"clone_directory":directory.path}))
+        })?;
+        platform::sync_dir(&directory.path)?;
+        platform::sync_dir(root)?;
+        Ok(directory)
     }
     pub(crate) fn validate(&self, root: &Path) -> Result<bool> {
         if self.path.parent() != Some(root)
@@ -122,6 +137,7 @@ impl CloneDirectory {
             || m.uid() != unsafe { libc::geteuid() }
             || m.gid() != self.gid
             || m.mode() & 0o077 != 0
+            || platform::has_granting_acl(&self.path)?
         {
             return Err(Error::new(
                 "E_CHANGED",

@@ -1025,6 +1025,9 @@ pub fn recover(path: &Path, acknowledge_create: bool) -> Result<Output> {
                 "journal target does not belong to the requested worktree",
             ));
         }
+        if !["reserved", "cloned", "prepared", "swapped"].contains(&j.stage.as_str()) {
+            return Err(Error::new("E_STATE", "unknown conversion journal stage"));
+        }
         let sibling = j
             .sibling
             .as_ref()
@@ -1053,10 +1056,13 @@ pub fn recover(path: &Path, acknowledge_create: bool) -> Result<Output> {
             Err(e) => return Err(e.into()),
         };
         if !sibling_exists
-            && ((j.clone.is_none() && j.stage == "reserved")
+            && (j.clone_directory.is_some()
+                || (j.clone.is_none() && j.stage == "reserved")
                 || (j.clone.is_some() && j.stage == "cloned"))
         {
-            // These stages cannot have installed a clone; no retained original needs protection.
+            // No owned sibling remains to remove. The entry may already have
+            // completed cleanup before a crash or another recovery error. Leave
+            // subsequent edits or deletion of its target untouched on retries.
             recovered.push(record.path.clone());
             finish_recovery(record, &mut pending_records)?;
             continue;
