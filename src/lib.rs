@@ -1,7 +1,9 @@
 pub mod backup;
 pub mod config;
 pub mod git;
+mod index;
 pub mod operations;
+mod parallel;
 pub mod platform;
 pub mod state;
 
