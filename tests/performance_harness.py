@@ -20,9 +20,11 @@ class PerformanceHarness(unittest.TestCase):
 
     def benchmark(self, env, binary=BINARY):
         output = self.f.base / "metrics.json"
-        result = subprocess.run([sys.executable, "tests/performance.py", "--source", str(self.f.repo),
-                                 "--binary", binary, "--output", str(output), "--repeats", "1",
-                                 "--budget", "300"], env=env, capture_output=True)
+        command = [sys.executable, "tests/performance.py", "--source", str(self.f.repo),
+                   "--binary", binary, "--output", str(output), "--repeats", "1", "--budget", "300"]
+        process, stdout, stderr, timed_out = run_bounded(command, env, 1800)
+        self.assertFalse(timed_out, (stdout, stderr))
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         self.assertTrue(output.exists(), (result.stdout, result.stderr))
         return result, json.loads(output.read_text())
 
