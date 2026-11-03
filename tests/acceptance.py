@@ -1,6 +1,7 @@
 """Real CLI/APFS tests; every repository and mutation lives in a disposable directory."""
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import shutil
@@ -74,6 +75,16 @@ class Fixture:
                 self.git("status", "--porcelain=v1", "-z", "--untracked-files=all", path=root),
                 self.git("diff", "--binary", path=root), self.git("diff", "--cached", "--binary", path=root),
                 Path(self.git("rev-parse", "--absolute-git-dir", path=root).decode().strip(), "index").read_bytes())
+
+    def journal_data(self):
+        result = []
+        for path in (self.repo / ".git/tool/operations").glob("*.json"):
+            document = json.loads(path.read_text())
+            if document["kind"] == "convert_batch":
+                result.extend(entry["journal"] for entry in document["files"])
+            else:
+                result.append(document)
+        return result
 
 
 @unittest.skipUnless(os.uname().sysname == "Darwin", "native acceptance requires macOS/APFS")
@@ -313,15 +324,108 @@ class Acceptance(unittest.TestCase):
                 self.assertEqual(before, f.state(target))
                 self.assertFalse(list(target.glob(".tool-clone-*")))
 
-    def test_uncheckpointed_clone_is_retained(self):
+    def test_parallel_cleanup_interruption_recovers_missing_originals(self):
+        f = self.f
+        for i in range(64):
+            f.write(f"many/{i}", f"payload {i}\n".encode())
+        f.head = f.commit()
+        source = f.state(f.repo)
+        for action, point, exit_code in [("CRASH", "convert_cleaned", 91),
+                                         ("FAIL", "convert_cleaned", 5),
+                                         ("FAIL", "convert_cleanup_flush", 5)]:
+            with self.subTest(action=action, point=point):
+                target = f.ordinary(f"{action}-{point}")
+                before = f.state(target)
+                env = dict(f.env, SPRIG_TEST_FAULTS="1")
+                env[f"SPRIG_TEST_{action}"] = point
+                result = run(BINARY, "--json", "convert", str(target), "--source", str(f.repo),
+                             "--no-time-machine-exclude", env=env, check=False)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                journals = f.journal_data()
+                self.assertEqual(len(journals), 68)
+                self.assertTrue(all(journal["stage"] == "swapped" for journal in journals))
+                self.assertTrue(any(not Path(journal["sibling"]).exists() for journal in journals))
+                if point == "convert_cleanup_flush":
+                    self.assertEqual(json.loads(result.stdout)["data"]["completed_files"], 68)
+                f.sprig("recover", target)
+                self.assertEqual(before, f.state(target))
+                self.assertEqual(source, f.state(f.repo))
+                self.assertFalse(list(target.glob(".tool-clones-*")))
+                self.assertFalse(list((f.repo / ".git/tool/operations").glob("*.json")))
+
+    def test_legacy_uncheckpointed_clone_is_retained(self):
         f = self.f; target = f.ordinary()
         env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_cloned")
         result = run(BINARY, "convert", str(target), "--no-time-machine-exclude", env=env, check=False)
         self.assertEqual(result.returncode, 91)
+        records = list((f.repo / ".git/tool/operations").glob("*.json"))
+        record = records[0]
+        document = json.loads(record.read_text())
+        journal = next(journal for journal in f.journal_data() if Path(journal["sibling"]).exists())
+        legacy = target / ".tool-clone-legacy"
+        Path(journal["sibling"]).rename(legacy)
+        if document["kind"] == "convert_batch":
+            document["files"] = [entry for entry in document["files"] if entry["journal"]["target"] != journal["target"]]
+            record.write_text(json.dumps(document))
+            record = record.with_name("operation-legacy.json")
+        journal["sibling"] = str(legacy.resolve())
+        journal["schema_version"] = 1
+        journal.pop("clone_directory", None)
+        journal.pop("pending_clone", None)
+        record.write_text(json.dumps(journal))
         out, _ = f.sprig("recover", target, code=5)
         self.assertEqual(out["code"], "E_RECOVERY")
         self.assertTrue(list(target.glob(".tool-clone-*")))
         self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
+
+    def test_owned_uncheckpointed_clones_are_recovered(self):
+        f = self.f
+        for i in range(32):
+            f.write(f"many/{i}", f"payload {i}\n".encode())
+        f.head = f.commit()
+        target = f.ordinary()
+        (target / "user-note").write_bytes(b"keep my untracked work")
+        before = f.state(target)
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_cloned")
+        result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                     "--no-time-machine-exclude", env=env, check=False)
+        self.assertEqual(result.returncode, 91, result.stderr)
+        self.assertTrue(list(target.glob(".tool-clones-*")))
+        f.sprig("recover", target)
+        self.assertEqual(before, f.state(target))
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+        self.assertEqual((target / "user-note").read_bytes(), b"keep my untracked work")
+
+    def test_owned_clone_recovery_retains_edits_and_replaced_directories(self):
+        f = self.f
+        for edit in ["clone", "directory"]:
+            with self.subTest(edit=edit):
+                target = f.ordinary(edit)
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_cloned")
+                result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                             "--no-time-machine-exclude", env=env, check=False)
+                self.assertEqual(result.returncode, 91, result.stderr)
+                records = list((f.repo / ".git/tool/operations").glob("*.json"))
+                journal = next(journal for journal in f.journal_data() if Path(journal["sibling"]).exists())
+                if edit == "clone":
+                    sibling = Path(journal["sibling"])
+                    sibling.write_bytes(b"user edit in retained copy")
+                    f.sprig("recover", target, code=5)
+                    self.assertEqual(sibling.read_bytes(), b"user edit in retained copy")
+                else:
+                    directory = Path(journal["clone_directory"]["path"])
+                    retained = target / "retained-clones"
+                    directory.rename(retained)
+                    directory.mkdir(mode=0o700)
+                    marker = directory / "must-keep"
+                    marker.write_bytes(b"unrelated user work")
+                    f.sprig("recover", target, code=4)
+                    self.assertEqual(marker.read_bytes(), b"unrelated user work")
+                    self.assertTrue(list(retained.glob(".tool-clone-*")))
+                # These disposable cases deliberately require inspection. Keep
+                # the next case independent without accepting ambiguous files.
+                for record in records:
+                    record.unlink(missing_ok=True)
 
     def test_disk_permission_and_cleanup_faults(self):
         f = self.f
@@ -345,7 +449,7 @@ class Acceptance(unittest.TestCase):
             self.assertTrue(ready.exists())
             f.sprig("convert", target, "--no-time-machine-exclude", code=4)
             journals = list((f.repo / ".git/tool/operations").glob("*.json"))
-            prepared_target = Path(json.loads(journals[0].read_text())["target"])
+            prepared_target = Path(f.journal_data()[0]["target"])
             prepared_target.write_bytes(b"external editor")
             child.kill(); child.communicate()
             out, _ = f.sprig("recover", target, code=5)
@@ -368,7 +472,7 @@ class Acceptance(unittest.TestCase):
                     while not ready.exists() and time.monotonic() < deadline:
                         time.sleep(0.02)
                     self.assertTrue(ready.exists())
-                    journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+                    journal = f.journal_data()[0]
                     changed = Path(journal["target"]); changed.write_bytes(b"external writer")
                     release.write_text("continue")
                     stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
@@ -377,15 +481,73 @@ class Acceptance(unittest.TestCase):
                     self.assertEqual(changed.read_bytes(), b"external writer")
                     # Accepting recovery requires resolving the external edit; all versions remain.
                     f.sprig("recover", target, code=5)
-                    for p in (f.repo / ".git/tool/operations").glob("*.json"):
-                        j = json.loads(p.read_text())
-                        # Disposable fixture cleanup only, after verifying the preservation failure path.
+                    for j in f.journal_data():
                         if j.get("sibling"):
                             Path(j["sibling"]).unlink(missing_ok=True)
+                    for p in (f.repo / ".git/tool/operations").glob("*.json"):
                         p.unlink()
                 finally:
                     if child.poll() is None:
                         child.kill(); child.communicate()
+
+    def test_conversion_retains_mmap_edits_before_swap_and_cleanup(self):
+        f = self.f
+        for point in ["convert_reserved", "convert_swapped", "convert_cleanup"]:
+            with self.subTest(point=point):
+                target = f.ordinary(point)
+                ready, release = f.base / (point + "-mmap-ready"), f.base / (point + "-mmap-release")
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE=point,
+                           SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                child = subprocess.Popen([BINARY, "--json", "convert", str(target), "--source", str(f.repo),
+                                          "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    path = Path(f.journal_data()[0]["target"])
+                    original = path.read_bytes()
+                    with path.open("r+b") as file, mmap.mmap(file.fileno(), 0) as mapping:
+                        mapping[0:1] = b"X"
+                        release.write_text("continue")
+                        stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                        self.assertEqual(child.returncode, 4, (stdout, stderr))
+                        self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                        self.assertEqual(path.read_bytes(), b"X" + original[1:])
+                    self.assertTrue(f.journal_data())
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.communicate()
+                # Each retained case belongs to this disposable test; do not
+                # accept changed recovery versions just to clear the next case.
+                for record in (f.repo / ".git/tool/operations").glob("*.json"):
+                    record.unlink()
+
+    def test_donor_edit_after_cloning_preserves_both_worktrees(self):
+        f = self.f
+        target = f.ordinary()
+        before = f.state(target)
+        ready, release = f.base / "donor-cloned-ready", f.base / "donor-cloned-release"
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="convert_cloned",
+                   SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+        child = subprocess.Popen([BINARY, "--json", "convert", str(target), "--source", str(f.repo),
+                                  "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            journal = f.journal_data()[0]
+            donor = f.repo / Path(journal["target"]).relative_to(target.resolve())
+            donor.write_bytes(b"new donor work after snapshot")
+            release.write_text("continue")
+            stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+            self.assertEqual(child.returncode, 0, (stdout, stderr))
+            self.assertEqual(before, f.state(target))
+            self.assertEqual(donor.read_bytes(), b"new donor work after snapshot")
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate()
 
     def test_eol_attributes_are_materialised_correctly(self):
         f = self.f
@@ -518,6 +680,407 @@ class Acceptance(unittest.TestCase):
         self.assertNotIn(b"0: ", run("ls", "-le", str(target / "b")).stdout)
         self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
 
+    def test_conversion_does_not_spawn_git_per_file(self):
+        f = self.f
+        small = f.ordinary("small")
+        def convert_count(target, name):
+            trace = f.base / (name + ".json")
+            out, _ = f.sprig("convert", target, "--source", f.repo,
+                             "--no-time-machine-exclude",
+                             env=dict(f.env, GIT_TRACE2_EVENT=str(trace)))
+            events = [json.loads(line) for line in trace.read_text().splitlines()]
+            return out, sum(event.get("event") == "start" for event in events)
+        _, small_count = convert_count(small, "small-trace")
+        for i in range(32):
+            f.write(f"many/{i}", f"convert this file {i}\n".encode())
+        f.head = f.commit()
+        target = f.ordinary()
+        out, large_count = convert_count(target, "large-trace")
+        self.assertGreaterEqual(out["data"]["replaced_files"], 32)
+        self.assertLessEqual(large_count, small_count, "Git subprocess count must not grow per converted file")
+        self.assertLess(large_count, 80)
+
+    def test_clone_directory_rejects_inherited_and_later_granting_acls(self):
+        f = self.f
+        target = f.ordinary("inherited")
+        before = f.state(target)
+        run("chmod", "+a", "everyone allow add_file,delete_child,file_inherit,directory_inherit", str(target))
+        out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+        self.assertEqual(out["code"], "E_UNSUPPORTED")
+        self.assertEqual(before, f.state(target))
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+        run("chmod", "-N", str(target))
+        target = f.ordinary("later-acl")
+        ready, release = f.base / "acl-ready", f.base / "acl-release"
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="convert_reserved",
+                   SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+        child = subprocess.Popen([BINARY, "--json", "convert", str(target), "--source", str(f.repo),
+                                  "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            directory = next(target.glob(".tool-clones-*"))
+            run("chmod", "+a", "everyone allow add_file,delete_child", str(directory))
+            release.write_text("continue")
+            stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+            self.assertEqual(child.returncode, 4, (stdout, stderr))
+            self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+            self.assertTrue(directory.exists())
+            run("chmod", "-N", str(directory))
+            f.sprig("recover", target)
+            self.assertEqual((target / "a").read_bytes(), (f.repo / "a").read_bytes())
+            self.assertFalse(directory.exists())
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate()
+
+    def test_conversion_rejects_writable_clone_parents(self):
+        f = self.f
+        f.write("secret/nested/data", b"private tracked data\n")
+        f.head = f.commit()
+        for name in ["writable-root", "writable-ancestor", "writable-internal", "sticky-root", "sticky-internal"]:
+            with self.subTest(name=name):
+                parent = f.base / (name + "-parent")
+                parent.mkdir()
+                target = f.ordinary(str(parent / "target"))
+                (target / "secret").chmod(0o700)
+                (target / "secret/nested").chmod(0o700)
+                before, source = f.state(target), f.state(f.repo)
+                if name == "writable-ancestor":
+                    parent.chmod(0o777)
+                elif name.endswith("internal"):
+                    (target / "secret").chmod(0o1777 if name == "sticky-internal" else 0o777)
+                else:
+                    target.chmod(0o1777 if name == "sticky-root" else 0o777)
+                if name.startswith("sticky"):
+
+                    out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude")
+                    self.assertEqual(out["data"]["replaced_files"], 5)
+                else:
+                    out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+                    self.assertEqual(out["code"], "E_UNSUPPORTED")
+                    if name != "writable-internal":
+                        self.assertFalse((f.repo / ".git/tool").exists())
+                    self.assertFalse(f.journal_data())
+                self.assertEqual(before, f.state(target))
+                self.assertEqual(source, f.state(f.repo))
+                self.assertEqual((target / "secret/nested/data").read_bytes(), b"private tracked data\n")
+                self.assertFalse(list(target.glob(".tool-clones-*")))
+                target.chmod(0o755)
+                parent.chmod(0o755)
+
+    def test_unsafe_later_batch_is_rejected_before_any_file_is_converted(self):
+        f = self.f
+        for i in range(1100):
+            f.write(f"many/{i}", f"payload {i}\n".encode())
+        f.write("zz-unsafe/private/data", b"private tracked contents\n")
+        f.head = f.commit()
+        target = f.ordinary()
+        (target / "zz-unsafe/private").chmod(0o700)
+        (target / "zz-unsafe").chmod(0o777)
+        before = f.state(target)
+        identities = {path.relative_to(target): path.stat().st_ino for path in target.rglob("*")
+                      if path.is_file() and not path.is_symlink()}
+        out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+        self.assertEqual(out["code"], "E_UNSUPPORTED")
+        self.assertEqual(before, f.state(target))
+        self.assertEqual(identities, {path: (target / path).stat().st_ino for path in identities})
+        self.assertFalse(f.journal_data())
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+
+    def test_recovery_retry_leaves_already_resolved_targets_untouched(self):
+        f = self.f
+        for edit in ["changed", "deleted"]:
+            with self.subTest(edit=edit):
+                target = f.ordinary(edit)
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_prepared")
+                result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                             "--no-time-machine-exclude", env=env, check=False)
+                self.assertEqual(result.returncode, 91)
+                journals = f.journal_data()
+                resolved, blocked = journals[0], journals[1]
+                run("xattr", "-w", "test.recovery", "hold", blocked["target"])
+                f.sprig("recover", target, code=5)
+                self.assertFalse(Path(resolved["sibling"]).exists())
+                path = Path(resolved["target"])
+                if edit == "changed":
+                    path.write_bytes(b"user edit between recovery attempts")
+                else:
+                    path.unlink()
+                run("xattr", "-d", "test.recovery", blocked["target"])
+                f.sprig("recover", target)
+                if edit == "changed":
+                    self.assertEqual(path.read_bytes(), b"user edit between recovery attempts")
+                else:
+                    self.assertFalse(path.exists())
+                self.assertFalse(f.journal_data())
+                self.assertFalse(list(target.glob(".tool-clones-*")))
+
+    def test_grouped_conversion_recovery_and_multiple_batches(self):
+        f = self.f
+        for i in range(1500):
+            f.write(f"many/{i // 50}/{i}", f"payload {i}\n".encode())
+        f.head = f.commit()
+        target = f.ordinary()
+        original = f.state(target)
+        source = f.state(f.repo)
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_swapped")
+        out = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                  "--no-time-machine-exclude", env=env, check=False)
+        self.assertEqual(out.returncode, 91, out.stderr)
+        journals = list((f.repo / ".git/tool/operations").glob("*.json"))
+        self.assertEqual(len(journals), 1)
+        self.assertEqual(len(f.journal_data()), 1024)
+        self.assertTrue(all(journal["stage"] == "prepared" for journal in f.journal_data()))
+        f.sprig("recover", target)
+        self.assertEqual(original, f.state(target))
+        result, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude")
+        already_shared = sum(file["reason"] == "same_clone_group" for file in result["data"]["files"])
+        self.assertGreater(already_shared, 0)
+        self.assertEqual(result["data"]["replaced_files"] + already_shared, 1504)
+        self.assertGreater(result["data"]["replaced_files"], 1024)
+        self.assertEqual(result["data"]["metadata_skipped_files"], 0)
+        self.assertEqual(source, f.state(f.repo))
+        self.assertEqual(original, f.state(target))
+        self.assertFalse(list(target.rglob(".tool-clone-*")))
+        self.assertFalse(list((f.repo / ".git/tool/operations").glob("*.json")))
+
+    def test_grouped_journal_publication_preserves_previous_checkpoints(self):
+        f = self.f
+        for point in ["journal_before_publish_prepared", "journal_after_publish_prepared",
+                      "journal_after_publish_swapped"]:
+            with self.subTest(point=point):
+                target = f.ordinary(point)
+                before = f.state(target)
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH=point)
+                result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                             "--no-time-machine-exclude", env=env, check=False)
+                self.assertEqual(result.returncode, 91, result.stderr)
+                journals = list((f.repo / ".git/tool/operations").glob("*.json"))
+                self.assertTrue(journals)
+                self.assertTrue(all(journal["original"] for journal in f.journal_data()))
+                f.sprig("recover", target)
+                self.assertEqual(before, f.state(target))
+                self.assertFalse(list(target.rglob(".tool-clone-*")))
+
+    def test_parallel_creation_matches_git_with_mixed_checkout_attributes(self):
+        f = self.f
+        for i in range(160):
+            f.write(f"many/{i // 16}/{i}", f"payload {i}\n".encode())
+        f.write(".gitattributes", b"many/0/* text eol=crlf\n")
+        f.head = f.commit()
+        before = f.state(f.repo)
+        target = f.base / "parallel-create"
+        out, _ = f.sprig("create", target, "--from", f.repo, "--no-time-machine-exclude")
+        self.assertGreater(out["data"]["cloned_files"], 32)
+        control = f.ordinary("control")
+        for path in f.git("ls-files", "-z").decode().split("\0"):
+            if path:
+                self.assertEqual((target / path).read_bytes(), (control / path).read_bytes(), path)
+        self.assertEqual(f.git("status", "--porcelain", path=target), b"")
+        self.assertEqual(before, f.state(f.repo))
+        donor = (f.repo / "many/1/17").read_bytes()
+        (target / "many/1/17").write_bytes(b"private edit")
+        self.assertEqual((f.repo / "many/1/17").read_bytes(), donor)
+
+    def test_parallel_journal_publication_recovers_a_partial_checkpoint(self):
+        f = self.f
+        for i in range(64):
+            f.write(f"many/{i}", f"payload {i}\n".encode())
+        f.head = f.commit()
+        target = f.ordinary()
+        before = f.state(target)
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="journal_after_publish_prepared")
+        result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                     "--no-time-machine-exclude", env=env, check=False)
+        self.assertEqual(result.returncode, 91, result.stderr)
+        stages = [journal["stage"] for journal in f.journal_data()]
+        self.assertGreater(len(stages), 16)
+        self.assertIn("prepared", stages)
+        self.assertTrue(set(stages) <= {"cloned", "prepared"})
+        f.sprig("recover", target)
+        self.assertEqual(before, f.state(target))
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+
+    def test_recovery_reads_earlier_individual_owned_clone_journals(self):
+        f = self.f
+        target = f.ordinary()
+        before = f.state(target)
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_prepared")
+        result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                     "--no-time-machine-exclude", env=env, check=False)
+        self.assertEqual(result.returncode, 91, result.stderr)
+        path = next((f.repo / ".git/tool/operations").glob("*.json"))
+        document = json.loads(path.read_text())
+        for entry in document["files"]:
+            old_path = path.with_stem(path.stem + "-" + str(entry["slot"]))
+            old_path.write_text(json.dumps(entry["journal"]))
+        path.unlink()
+        f.sprig("recover", target)
+        self.assertEqual(before, f.state(target))
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+
+    def test_recovery_rejects_duplicate_batch_slots_without_changes(self):
+        f = self.f
+        target = f.ordinary()
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_prepared")
+        result = run(BINARY, "convert", str(target), "--source", str(f.repo),
+                     "--no-time-machine-exclude", env=env, check=False)
+        self.assertEqual(result.returncode, 91, result.stderr)
+        path = next((f.repo / ".git/tool/operations").glob("*.json"))
+        document = json.loads(path.read_text())
+        document["files"][1]["slot"] = document["files"][0]["slot"]
+        path.write_text(json.dumps(document))
+        before = f.state(target)
+        out, _ = f.sprig("recover", target, code=5)
+        self.assertEqual(out["code"], "E_STATE")
+        self.assertEqual(before, f.state(target))
+        self.assertTrue(path.exists())
+
+    def test_creation_index_refresh_preserves_concurrent_index_edits(self):
+        f = self.f
+        for action in ["stage", "truncate"]:
+            with self.subTest(action=action):
+                target = f.base / ("index-" + action)
+                ready, release = f.base / (action + "-ready"), f.base / (action + "-release")
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="create_before_index",
+                           SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                          "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    index = Path(f.git("rev-parse", "--absolute-git-dir", path=target).decode().strip()) / "index"
+                    if action == "stage":
+                        (target / "user-added").write_bytes(b"keep my staged work")
+                        f.git("add", "user-added", path=target)
+                    else:
+                        index.write_bytes(b"")
+                    original_index = index.read_bytes()
+                    release.write_text("continue")
+                    stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                    self.assertEqual(child.returncode, 4, (stdout, stderr))
+                    self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                    self.assertEqual(index.read_bytes(), original_index)
+                    if action == "stage":
+                        self.assertEqual((target / "user-added").read_bytes(), b"keep my staged work")
+                        self.assertIn(b"user-added", f.git("diff", "--cached", "--name-only", path=target))
+                    f.sprig("recover", f.repo, "--acknowledge-create")
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.communicate()
+
+    def test_index_publication_preserves_uncooperative_edits(self):
+        f = self.f
+        for point in ["index_after_read", "index_before_publish"]:
+            for action in ["truncate", "mmap", "replace"]:
+                with self.subTest(point=point, action=action):
+                    name = point + action
+                    target = f.base / name
+                    ready, release = f.base / (name + "-ready"), f.base / (name + "-release")
+                    env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE=point,
+                               SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                    child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                              "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not ready.exists() and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue(ready.exists())
+                        admin = Path(f.git("rev-parse", "--absolute-git-dir", path=target).decode().strip())
+                        self.assertTrue((admin / "index.lock").exists())
+                        index = admin / "index"
+                        if action == "truncate":
+                            index.write_bytes(b"")
+                        elif action == "replace":
+                            other = admin / "external-index"
+                            other.write_bytes(index.read_bytes())
+                            other.replace(index)
+                        else:
+                            with index.open("r+b") as file, mmap.mmap(file.fileno(), 0) as mapping:
+                                mapping[-1] ^= 1
+                        expected = index.read_bytes()
+                        release.write_text("continue")
+                        stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                        self.assertEqual(child.returncode, 4, (stdout, stderr))
+                        self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                        self.assertEqual(index.read_bytes(), expected)
+                        self.assertFalse((admin / "index.lock").exists())
+                        f.sprig("recover", f.repo, "--acknowledge-create")
+                    finally:
+                        if child.poll() is None:
+                            child.kill(); child.communicate()
+
+    def test_index_flags_are_checked_without_clones(self):
+        f = self.f
+        f.git("config", "core.autocrlf", "true")
+        for flag in ["--skip-worktree", "--assume-unchanged"]:
+            with self.subTest(flag=flag):
+                target = f.base / flag.lstrip("-")
+                ready, release = f.base / (target.name + "-ready"), f.base / (target.name + "-release")
+                env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="create_before_index",
+                           SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+                child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                          "--no-time-machine-exclude"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(ready.exists())
+                    f.git("update-index", flag, "a", path=target)
+                    index = Path(f.git("rev-parse", "--absolute-git-dir", path=target).decode().strip()) / "index"
+                    expected = index.read_bytes()
+                    release.write_text("continue")
+                    stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+                    self.assertEqual(child.returncode, 4, (stdout, stderr))
+                    self.assertEqual(json.loads(stdout)["code"], "E_CHANGED")
+                    self.assertEqual(index.read_bytes(), expected)
+                    f.sprig("recover", f.repo, "--acknowledge-create")
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.communicate()
+
+    def test_creation_index_refresh_matches_git_for_v4_and_split_indexes(self):
+        for name, config in [("v4", {"index.version": "4"}),
+                             ("split", {"core.splitIndex": "true"})]:
+            with self.subTest(name=name):
+                base = self.f.base / name
+                base.mkdir()
+                f = Fixture(base)
+                for key, value in config.items():
+                    f.git("config", key, value)
+                before = f.state(f.repo)
+                target = base / "cow"
+                f.sprig("create", target, "--from", f.repo, "--no-time-machine-exclude")
+                self.assertEqual(f.git("status", "--porcelain", path=target), b"")
+                self.assertEqual(f.git("write-tree", path=target).strip(),
+                                 f.git("rev-parse", "HEAD^{tree}").strip())
+                self.assertEqual(before, f.state(f.repo))
+
+    def test_preflight_uses_cached_attributes_only_for_a_matching_index(self):
+        f = self.f
+        trace = f.base / "preflight-trace.json"
+        f.sprig("create", f.base / "preview", "--from", f.repo, "--dry-run",
+                env=dict(f.env, GIT_TRACE2_EVENT=str(trace)))
+        starts = [json.loads(line) for line in trace.read_text().splitlines()]
+        attrs = [event["argv"] for event in starts if event.get("event") == "start"
+                 and "check-attr" in event.get("argv", [])]
+        self.assertEqual(len(attrs), 1)
+        self.assertIn("--cached", attrs[0])
+        f.write(".gitattributes", b"a filter=unsupported\n")
+        f.git("add", ".gitattributes")
+        out, _ = f.sprig("create", f.base / "staged", "--from", f.repo, "--dry-run", code=4)
+        self.assertEqual(out["code"], "E_DIRTY", "staged attributes must not replace HEAD's attributes")
+        f.head = f.commit()
+        f.write(".gitattributes", b"")
+        f.git("add", ".gitattributes")
+        out, _ = f.sprig("create", f.base / "staged-clean", "--from", f.repo, "--dry-run", code=3)
+        self.assertEqual(out["code"], "E_UNSUPPORTED", "staging removal must not hide HEAD's filter")
+
     def test_lf_text_attributes_do_not_spawn_per_file_filter_processes(self):
         cases = [
             (b"* text=auto\n", {}),
@@ -603,16 +1166,24 @@ class Acceptance(unittest.TestCase):
                     env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH=point)
                     result = run(BINARY, "convert", str(target), "--no-time-machine-exclude", env=env, check=False)
                     self.assertEqual(result.returncode, 91)
-                    journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+                    journal = f.journal_data()[0]
                     Path(journal["sibling"]).unlink(missing_ok=True)
                     path = Path(journal["target"])
                     if edit == "changed":
                         path.write_bytes(b"user edit after failure")
                     else:
                         path.unlink()
-                    before = f.state(target)
+                    user_note = target / "user-note"
+                    user_note.write_bytes(b"keep my untracked work")
+                    before = list(f.state(target))
+                    siblings = {b"?? " + str(Path(journal["sibling"]).relative_to(target.resolve())).encode()
+                                for journal in f.journal_data()}
+                    # Recovery clears the other owned clones in the batch too;
+                    # compare user state while allowing those temporary removals.
+                    before[1] = b"\0".join(record for record in before[1].split(b"\0") if record not in siblings)
                     f.sprig("recover", target)
-                    self.assertEqual(before, f.state(target))
+                    self.assertEqual(tuple(before), f.state(target))
+                    self.assertEqual(user_note.read_bytes(), b"keep my untracked work")
                     if edit == "changed":
                         self.assertEqual(path.read_bytes(), b"user edit after failure")
                     else:
@@ -624,7 +1195,7 @@ class Acceptance(unittest.TestCase):
         env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_CRASH="convert_prepared")
         result = run(BINARY, "convert", str(target), "--no-time-machine-exclude", env=env, check=False)
         self.assertEqual(result.returncode, 91)
-        journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+        journal = f.journal_data()[0]
         Path(journal["sibling"]).unlink()
         f.sprig("recover", target)
         self.assertEqual(before, f.state(target))
@@ -638,7 +1209,7 @@ class Acceptance(unittest.TestCase):
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(ready.exists())
-            journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+            journal = f.journal_data()[0]
             changed = Path(journal["target"])
             original = changed.read_bytes()
             donor = f.repo / changed.relative_to(target.resolve())
@@ -667,7 +1238,7 @@ class Acceptance(unittest.TestCase):
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(ready.exists())
-            journal = json.loads(next((f.repo / ".git/tool/operations").glob("*.json")).read_text())
+            journal = f.journal_data()[0]
             self.assertEqual(journal["creation"]["destination_identity"], [target.stat().st_dev, target.stat().st_ino])
             self.assertEqual(journal["creation"]["requested_new_branch"], "feature/race")
             self.assertFalse(journal["creation"]["confirmed_new_branch"])

@@ -22,6 +22,11 @@ fn real_apfs_metadata_and_swap() -> Result<()> {
         .status()?
         .success());
     let before = platform::fingerprint(&target)?;
+    assert_eq!(before.acl, platform::acl(&target)?);
+    assert_eq!(
+        before.xattrs.get("test.target"),
+        Some(&blake3::hash(b"must remain").to_hex().to_string())
+    );
     platform::clone(&donor, &temp)?;
     platform::metadata(&target, &temp)?;
     let new = platform::fingerprint(&temp)?;

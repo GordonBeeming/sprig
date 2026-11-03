@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -91,6 +91,10 @@ impl Fingerprint {
     }
 }
 pub fn open_regular(path: &Path) -> Result<File> {
+    let (file, _metadata) = open_regular_with_metadata(path)?;
+    Ok(file)
+}
+fn open_regular_with_metadata(path: &Path) -> Result<(File, fs::Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -110,7 +114,7 @@ pub fn open_regular(path: &Path) -> Result<File> {
             ),
         ));
     }
-    Ok(file)
+    Ok((file, m))
 }
 
 pub fn preserve_group(path: &Path, gid: u32) -> Result<()> {
@@ -135,8 +139,12 @@ pub fn preserve_group(path: &Path, gid: u32) -> Result<()> {
 }
 
 pub fn fingerprint(path: &Path) -> Result<Fingerprint> {
-    let mut file = open_regular(path)?;
-    let before = file.metadata()?;
+    let (fingerprint, _file) = fingerprint_with_file(path)?;
+    Ok(fingerprint)
+}
+
+pub(crate) fn fingerprint_with_file(path: &Path) -> Result<(Fingerprint, File)> {
+    let (mut file, before) = open_regular_with_metadata(path)?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = [0u8; 131072];
     loop {
@@ -167,14 +175,16 @@ pub fn fingerprint(path: &Path) -> Result<Fingerprint> {
         ));
     }
     let mut attrs = BTreeMap::new();
-    for name in xattr::list(path)? {
+    use xattr::FileExt;
+    for name in file.list_xattr()? {
         let key = name
             .into_string()
             .map_err(|_| Error::new("E_UNSUPPORTED", "non-UTF-8 extended attribute name"))?;
-        if let Some(value) = xattr::get(path, &key)? {
+        if let Some(value) = file.get_xattr(&key)? {
             attrs.insert(key, blake3::hash(&value).to_hex().to_string());
         }
     }
+    let file_acl = acl_for_file(&file)?;
     let m = fs::symlink_metadata(path)?;
     if m.ino() != before.ino()
         || m.dev() != before.dev()
@@ -186,22 +196,25 @@ pub fn fingerprint(path: &Path) -> Result<Fingerprint> {
             "file identity or metadata changed while reading",
         ));
     }
-    Ok(Fingerprint {
-        dev: m.dev(),
-        ino: m.ino(),
-        len: m.len(),
-        mode: m.mode(),
-        uid: m.uid(),
-        gid: m.gid(),
-        mtime: (m.mtime(), m.mtime_nsec()),
-        ctime: (m.ctime(), m.ctime_nsec()),
-        atime: (m.atime(), m.atime_nsec()),
-        birth: birth(&m),
-        flags: flags(&m),
-        digest: hash.finalize().to_hex().to_string(),
-        xattrs: attrs,
-        acl: acl(path)?,
-    })
+    Ok((
+        Fingerprint {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            atime: (m.atime(), m.atime_nsec()),
+            birth: birth(&m),
+            flags: flags(&m),
+            digest: hash.finalize().to_hex().to_string(),
+            xattrs: attrs,
+            acl: file_acl,
+        },
+        file,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -239,6 +252,7 @@ mod native {
             flags: u32,
         ) -> libc::c_int;
         fn renamex_np(a: *const libc::c_char, b: *const libc::c_char, flags: u32) -> libc::c_int;
+        fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
         fn acl_get_file(path: *const libc::c_char, kind: libc::c_int) -> *mut libc::c_void;
         fn acl_to_text(acl: *mut libc::c_void, len: *mut libc::ssize_t) -> *mut libc::c_char;
         fn acl_free(object: *mut libc::c_void) -> libc::c_int;
@@ -328,23 +342,45 @@ mod native {
             }
             return Err(error.into());
         }
+        acl_text(value)
+    }
+    pub fn acl_for_file(file: &File) -> Result<String> {
+        let value = unsafe { acl_get_fd(file.as_raw_fd()) };
+        if value.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(String::new());
+            }
+            return Err(error.into());
+        }
+        acl_text(value)
+    }
+    fn acl_text(value: *mut libc::c_void) -> Result<String> {
         let mut len = 0;
         let raw = unsafe { acl_to_text(value, &mut len) };
         if raw.is_null() {
+            let error = std::io::Error::last_os_error();
             unsafe {
                 acl_free(value);
             }
-            return Err(std::io::Error::last_os_error().into());
+            return Err(error.into());
         }
-        let text = String::from_utf8_lossy(unsafe {
-            std::slice::from_raw_parts(raw.cast::<u8>(), len as usize)
-        })
-        .to_string();
+        let len = match usize::try_from(len) {
+            Ok(len) => len,
+            Err(_) => {
+                unsafe {
+                    acl_free(raw.cast());
+                    acl_free(value);
+                }
+                return Err(Error::new("E_IO", "invalid ACL text length"));
+            }
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(raw.cast::<u8>(), len) }.to_vec();
         unsafe {
             acl_free(raw.cast());
             acl_free(value);
         }
-        Ok(text)
+        String::from_utf8(bytes).map_err(|_| Error::new("E_UNSUPPORTED", "non-UTF-8 ACL text"))
     }
     #[repr(C)]
     struct AttrList {
@@ -405,6 +441,8 @@ mod native {
     }
 }
 #[cfg(target_os = "macos")]
+use native::acl_for_file;
+#[cfg(target_os = "macos")]
 pub use native::{acl, clone, clone_id, metadata, supported, swap};
 #[cfg(not(target_os = "macos"))]
 pub fn supported(_: &Path) -> Result<()> {
@@ -431,6 +469,11 @@ pub fn clone_id(_: &Path) -> Result<Option<u64>> {
 }
 #[cfg(not(target_os = "macos"))]
 pub fn acl(_: &Path) -> Result<String> {
+    Ok(String::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn acl_for_file(_: &File) -> Result<String> {
     Ok(String::new())
 }
 
@@ -471,30 +514,59 @@ pub fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn sync_pending(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // Submit this inode before a batch's sync_all forces the volume's drive
+    // cache. This is never the final durability barrier on its own.
+    if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+pub(crate) fn has_granting_acl(path: &Path) -> Result<bool> {
+    Ok(acl(path)?
+        .lines()
+        .any(|line| !line.is_empty() && !line.starts_with("!#acl") && !line.contains(":deny:")))
+}
+
 pub fn validate_workspace_parent(path: &Path) -> Result<()> {
     let user = unsafe { libc::geteuid() };
     for directory in path.ancestors() {
-        supported(directory)?;
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
-            return Err(Error::new(
-                "E_UNSUPPORTED",
-                "destination ancestors must be directories owned by the current user or root",
-            ));
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
-        }
-        // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
-        if acl(directory)?
-            .lines()
-            .any(|line| !line.is_empty() && !line.starts_with("!#acl") && !line.contains(":deny:"))
-        {
-            return Err(Error::new(
-                "E_UNSUPPORTED",
-                "destination ancestors with allow ACL entries are unsupported",
-            ));
-        }
+        validate_workspace_directory(directory, user)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_workspace_parents<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    let directories: BTreeSet<_> = paths.into_iter().flat_map(Path::ancestors).collect();
+    let user = unsafe { libc::geteuid() };
+    for directory in directories {
+        validate_workspace_directory(directory, user)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_directory(directory: &Path, user: libc::uid_t) -> Result<()> {
+    supported(directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
+        return Err(Error::new(
+            "E_UNSUPPORTED",
+            "destination ancestors must be directories owned by the current user or root",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
+    }
+    // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
+    if has_granting_acl(directory)? {
+        return Err(Error::new(
+            "E_UNSUPPORTED",
+            "destination ancestors with allow ACL entries are unsupported",
+        ));
     }
     Ok(())
 }

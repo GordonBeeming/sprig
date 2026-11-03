@@ -62,18 +62,22 @@ To discover and preview conversion across repository locations, use the optional
 
 Conversion discovers compatible registered donors in the same repository; `--source` restricts selection. Commits may differ. Git object IDs narrow the search, then cryptographic BLAKE3 digests of materialised bytes verify matches. Different line endings do not count as identical. Staged/unstaged paths and unsupported file types are skipped, with a reason for each tracked path. Untracked and ignored files remain untouched.
 
-Each replacement uses an owned sibling file, target metadata, a durable journal and native atomic swap. The original stays at the sibling until validation and cleanup finish. Conversion preserves index bytes; the new inode makes Git's stat cache stale, so the next ordinary Git operation may rehash files and refresh that cache.
+Replacements use sibling files in an owned directory, target metadata, a durable batch journal and native atomic swaps. The original stays at the sibling until validation and cleanup finish. Conversion preserves index bytes; the new inode makes Git's stat cache stale, so the next ordinary Git operation may rehash files and refresh that cache.
 
 ```sh
 sprig doctor ../workspace --json
 sprig recover ../workspace --json
 ```
 
-Recovery verifies file identities and contents before removing a known sibling. It retains changed or unknown files for manual resolution. A crash immediately after native cloning but before its ownership checkpoint can leave an uncheckpointed sibling: inspect it, remove it only when satisfied it is disposable, then retry recovery. Neither recovery nor normal cleanup prunes unrelated Git registrations or deletes branches.
+Recovery verifies file identities and contents before removing a known sibling. It retains changed or unknown files for manual resolution. Owned-directory journals can recover an uncheckpointed copy after verifying that the original is unchanged and the copy matches its expected bytes and metadata. Legacy journals without that ownership proof retain uncheckpointed siblings for inspection. Neither recovery nor normal cleanup prunes unrelated Git registrations or deletes branches.
 
-If a journal proves no swap occurred and its sibling is already absent, recovery clears only that journal. Later user edits or deletion of the target do not block this cleanup.
+When an owned sibling is already absent, recovery leaves that entry's target untouched, including later edits or deletion. This makes retries safe after partial cleanup or an earlier recovery attempt. The batch journal remains until its entries and owned directory are resolved. Owned clone directories and their parents cannot have granting ACLs; validation also checks for ACL changes during conversion.
 
-Interrupted creation retains its directory, any branch/registration and its journal. Inspect HEAD, index and local files first. A registered directory with no index needs `git read-tree HEAD` only after checking that no user index state needs saving; `git checkout-index --all` can restore missing paths without `--force`. `sprig recover <repository> --acknowledge-create` accepts the retained creation state and clears its journal without changing workspace files or refs. It does not claim the workspace has been repaired.
+Directories receiving converted files and their ancestors must be owned by the current user or root. Group/world-writable directories need sticky protection. Unsafe worktree roots are rejected before mutation; all target directories are checked before cloning and checked again per batch.
+
+Creation validates the destination index even when every file is materialised by Git. A busy index lock, unsupported index flags or a concurrent index change stops creation and retains the workspace for inspection.
+
+Interrupted creation retains its directory, any branch/registration and its journal. Inspect HEAD, index and local files first. Locate the worktree index lock with `git rev-parse --git-path index.lock`; remove a stale lock only after confirming Git has stopped. A registered directory with no index needs `git read-tree HEAD` only after checking that no user index state needs saving; `git checkout-index --all` can restore missing paths without `--force`. `sprig recover <repository> --acknowledge-create` accepts the retained creation state and clears its journal without changing workspace files or refs. It does not claim the workspace has been repaired.
 
 ## Time Machine
 

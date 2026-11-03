@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -14,6 +15,58 @@ pub struct Repository {
     pub common: PathBuf,
     pub admin: PathBuf,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+fn stamp(path: &Path) -> Result<Option<Stamp>> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(Some(Stamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug)]
+pub struct Snapshot {
+    bytes: Vec<u8>,
+    watched: FileStamps,
+}
+type FileStamps = Vec<(PathBuf, Option<Stamp>)>;
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for Snapshot {}
+fn stamps_unchanged(watched: &[(PathBuf, Option<Stamp>)]) -> Result<bool> {
+    for (path, before) in watched {
+        if stamp(path)? != *before {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+impl Snapshot {
+    pub fn unchanged(&self, repo: &Repository) -> Result<bool> {
+        if !self.watched.is_empty() && stamps_unchanged(&self.watched)? {
+            return Ok(true);
+        }
+        Ok(self == &repo.snapshot()?)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub mode: String,
@@ -81,7 +134,7 @@ where
     Ok(output.stdout)
 }
 
-pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String, String>> {
+fn raw_hashes(root: &Path, entries: &[&Entry]) -> Result<BTreeMap<String, String>> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -103,12 +156,22 @@ pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String
         command.env_remove(key);
     }
     let mut child = command.spawn()?;
+    let mut writer = None;
     let result = (|| -> Result<_> {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| Error::new("E_GIT", "missing cat-file stdin"))?;
-        let mut stdout = BufReader::new(
+        let mut input = Vec::new();
+        for entry in entries {
+            if matches!(entry.mode.as_str(), "100644" | "100755") {
+                input.extend_from_slice(entry.oid.as_bytes());
+                input.push(0);
+            }
+        }
+        writer = Some(std::thread::spawn(move || stdin.write_all(&input)));
+        let mut stdout = BufReader::with_capacity(
+            256 * 1024,
             child
                 .stdout
                 .take()
@@ -119,8 +182,6 @@ pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String
             if !matches!(entry.mode.as_str(), "100644" | "100755") {
                 continue;
             }
-            stdin.write_all(format!("{}\0", entry.oid).as_bytes())?;
-            stdin.flush()?;
             let mut header = Vec::new();
             stdout.read_until(0, &mut header)?;
             let header = std::str::from_utf8(&header)
@@ -139,19 +200,57 @@ pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String
             if copied != size || terminator != [0] {
                 return Err(Error::new("E_GIT", "truncated cat-file response"));
             }
-            hashes.insert(entry.path.clone(), hash.finalize().to_hex().to_string());
+            hashes.insert(entry.oid.clone(), hash.finalize().to_hex().to_string());
         }
-        drop(stdin);
         Ok(hashes)
     })();
     if result.is_err() {
         let _ = child.kill();
     }
-    let status = child.wait()?;
+    let status = child.wait();
+    let written = writer
+        .map(|writer| {
+            writer
+                .join()
+                .map_err(|_| Error::new("E_GIT", "cat-file input writer terminated"))
+        })
+        .transpose()?;
+    let status = status?;
+    if result.is_ok() {
+        if let Some(written) = written {
+            written?;
+        }
+    }
     if !status.success() && result.is_ok() {
         return Err(Error::new("E_GIT", "cat-file failed"));
     }
-    let mut hashes = result?;
+    result
+}
+
+pub fn rendered_hashes(root: &Path, entries: &[Entry]) -> Result<BTreeMap<String, String>> {
+    let unique: BTreeMap<_, _> = entries
+        .iter()
+        .filter(|e| matches!(e.mode.as_str(), "100644" | "100755"))
+        .map(|e| (e.oid.as_str(), e))
+        .collect();
+    let count = if unique.len() >= 128 { 4 } else { 1 };
+    let mut chunks = vec![vec![]; count];
+    for (index, entry) in unique.into_values().enumerate() {
+        chunks[index % count].push(entry);
+    }
+    let mut objects = BTreeMap::new();
+    for hashes in crate::parallel::map_bounded(chunks, count, |chunk| raw_hashes(root, &chunk))? {
+        objects.extend(hashes);
+    }
+    let mut hashes: BTreeMap<_, _> = entries
+        .iter()
+        .filter(|e| matches!(e.mode.as_str(), "100644" | "100755"))
+        .filter_map(|e| {
+            objects
+                .get(&e.oid)
+                .map(|digest| (e.path.clone(), digest.clone()))
+        })
+        .collect();
     let mut input = Vec::new();
     for entry in entries {
         input.extend_from_slice(entry.path.as_bytes());
@@ -447,11 +546,30 @@ impl Repository {
             input.extend_from_slice(e.path.as_bytes());
             input.push(0);
         }
+        // Tree attribute lookup scales poorly with large directory trees. The
+        // index gives identical attributes only when its entries match this commit.
+        let attribute_source = match run(
+            &self.root,
+            [
+                "diff-index",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                target,
+                "--",
+            ],
+            None,
+        ) {
+            Ok(_) => "--cached".to_string(),
+            Err(e) if e.data["git_exit_code"] == 1 => format!("--source={target}"),
+            Err(e) => return Err(e),
+        };
         let attrs = text(run(
             &self.root,
             [
                 "check-attr",
-                &format!("--source={target}"),
+                &attribute_source,
                 "-z",
                 "--stdin",
                 "filter",
@@ -472,7 +590,8 @@ impl Repository {
         Ok(())
     }
     pub fn idle(&self) -> Result<()> {
-        for dir in [&self.admin, &self.common] {
+        let common = (self.common != self.admin).then_some(&self.common);
+        for dir in std::iter::once(&self.admin).chain(common) {
             for name in [
                 "index.lock",
                 "HEAD.lock",
@@ -495,13 +614,87 @@ impl Repository {
         }
         Ok(())
     }
-    pub fn snapshot(&self) -> Result<Vec<u8>> {
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let watched = self.snapshot_watches()?.unwrap_or_default();
+        // Git remains authoritative for ref resolution. File stamps only avoid
+        // resolving the same HEAD and rereading an unchanged index per candidate.
         let mut bytes = self.head()?.into_bytes();
         bytes.extend(run(&self.root, ["symbolic-ref", "-q", "HEAD"], None).unwrap_or_default());
         if self.admin.join("index").exists() {
             bytes.extend(std::fs::read(self.admin.join("index"))?);
         }
-        Ok(bytes)
+        if !stamps_unchanged(&watched)? {
+            return Err(Error::new(
+                "E_CHANGED",
+                "Git metadata changed while taking snapshot",
+            ));
+        }
+        Ok(Snapshot {
+            bytes: blake3::hash(&bytes).as_bytes().to_vec(),
+            watched,
+        })
+    }
+
+    fn snapshot_watches(&self) -> Result<Option<FileStamps>> {
+        let mut watched = vec![];
+        for path in [self.common.join("reftable"), self.admin.join("reftable")] {
+            let state = stamp(&path)?;
+            if state.is_some() {
+                return Ok(None);
+            }
+            watched.push((path, state));
+        }
+        for path in [self.admin.join("index"), self.common.join("packed-refs")] {
+            let state = stamp(&path)?;
+            watched.push((path, state));
+        }
+        let mut path = self.admin.join("HEAD");
+        let mut visited = BTreeSet::new();
+        for _ in 0..16 {
+            if !visited.insert(path.clone()) {
+                return Ok(None);
+            }
+            let state = stamp(&path)?;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)) => {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            watched.push((path, state));
+            let reference = match bytes.as_deref() {
+                Some(value) if value.starts_with(b"ref:") => {
+                    let Some(value) = value.strip_prefix(b"ref: ") else {
+                        return Ok(None);
+                    };
+                    let Ok(value) = std::str::from_utf8(value) else {
+                        return Ok(None);
+                    };
+                    let value = value.trim_end_matches('\n');
+                    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                        return Ok(None);
+                    }
+                    value
+                }
+                _ => return Ok(Some(watched)),
+            };
+            // Unusual symbolic references remain Git's responsibility.
+            if !reference.starts_with("refs/") || safe_path(reference).is_err() {
+                return Ok(None);
+            }
+            let per_worktree = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+                .iter()
+                .any(|prefix| reference.starts_with(prefix));
+            path = if per_worktree {
+                &self.admin
+            } else {
+                &self.common
+            }
+            .join(reference);
+        }
+        Ok(None)
     }
 }
 

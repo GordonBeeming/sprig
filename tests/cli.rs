@@ -27,3 +27,18 @@ fn bulk_adoption_helper() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn performance_harness_safety() -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("python3")
+        .arg("tests/performance_harness.py")
+        .env("SPRIG_BINARY", env!("CARGO_BIN_EXE_sprig"))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
