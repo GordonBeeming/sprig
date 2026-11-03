@@ -475,6 +475,9 @@ pub fn convert(
 ) -> Result<Output> {
     let repo = Repository::open(path)?;
     platform::supported(&repo.root)?;
+    if !dry_run {
+        platform::validate_workspace_parent(&repo.root)?;
+    }
     let head = repo.head()?;
     repo.preflight(&head)?;
     // Even when backup policy is disabled, a main checkout remains eligible for file conversion.
@@ -622,6 +625,11 @@ pub fn convert(
     if dry_run {
         return Ok(output);
     }
+    platform::validate_workspace_parents(
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.target.parent()),
+    )?;
     platform::supported(&repo.root)?;
     for root in &donor_roots {
         if !root.is_dir() {
@@ -734,6 +742,11 @@ fn replace_batch(
     count: &mut u64,
     bytes: &mut u64,
 ) -> Result<Vec<PathBuf>> {
+    platform::validate_workspace_parents(
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.target.parent()),
+    )?;
     let directory = state::CloneDirectory::new(&repo.root)?;
     match replace_in_directory(repo, candidates, validate, count, bytes, &directory) {
         Ok(skipped) => Ok(skipped),

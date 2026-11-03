@@ -73,6 +73,8 @@ Recovery verifies file identities and contents before removing a known sibling. 
 
 When an owned sibling is already absent, recovery leaves that entry's target untouched, including later edits or deletion. This makes retries safe after partial cleanup or an earlier recovery attempt. The batch journal remains until its entries and owned directory are resolved. Owned clone directories and their parents cannot have granting ACLs; validation also checks for ACL changes during conversion.
 
+Directories receiving converted files and their ancestors must be owned by the current user or root. Group/world-writable directories need sticky protection. Unsafe worktree roots are rejected before mutation; all target directories are checked before cloning and checked again per batch.
+
 Creation validates the destination index even when every file is materialised by Git. A busy index lock, unsupported index flags or a concurrent index change stops creation and retains the workspace for inspection.
 
 Interrupted creation retains its directory, any branch/registration and its journal. Inspect HEAD, index and local files first. Locate the worktree index lock with `git rev-parse --git-path index.lock`; remove a stale lock only after confirming Git has stopped. A registered directory with no index needs `git read-tree HEAD` only after checking that no user index state needs saving; `git checkout-index --all` can restore missing paths without `--force`. `sprig recover <repository> --acknowledge-create` accepts the retained creation state and clears its journal without changing workspace files or refs. It does not claim the workspace has been repaired.

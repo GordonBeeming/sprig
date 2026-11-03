@@ -94,12 +94,7 @@ pub struct CloneDirectory {
 }
 impl CloneDirectory {
     pub(crate) fn new(root: &Path) -> Result<Self> {
-        if platform::has_granting_acl(root)? {
-            return Err(Error::new(
-                "E_UNSUPPORTED",
-                "clone-directory parent has a granting ACL",
-            ));
-        }
+        platform::validate_workspace_parent(root)?;
         let dir = tempfile::Builder::new()
             .prefix(".tool-clones-")
             .tempdir_in(root)?;

@@ -736,6 +736,60 @@ class Acceptance(unittest.TestCase):
             if child.poll() is None:
                 child.kill(); child.communicate()
 
+    def test_conversion_rejects_writable_clone_parents(self):
+        f = self.f
+        f.write("secret/nested/data", b"private tracked data\n")
+        f.head = f.commit()
+        for name in ["writable-root", "writable-ancestor", "writable-internal", "sticky-root", "sticky-internal"]:
+            with self.subTest(name=name):
+                parent = f.base / (name + "-parent")
+                parent.mkdir()
+                target = f.ordinary(str(parent / "target"))
+                (target / "secret").chmod(0o700)
+                (target / "secret/nested").chmod(0o700)
+                before, source = f.state(target), f.state(f.repo)
+                if name == "writable-ancestor":
+                    parent.chmod(0o777)
+                elif name.endswith("internal"):
+                    (target / "secret").chmod(0o1777 if name == "sticky-internal" else 0o777)
+                else:
+                    target.chmod(0o1777 if name == "sticky-root" else 0o777)
+                if name.startswith("sticky"):
+
+                    out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude")
+                    self.assertEqual(out["data"]["replaced_files"], 5)
+                else:
+                    out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+                    self.assertEqual(out["code"], "E_UNSUPPORTED")
+                    if name != "writable-internal":
+                        self.assertFalse((f.repo / ".git/tool").exists())
+                    self.assertFalse(f.journal_data())
+                self.assertEqual(before, f.state(target))
+                self.assertEqual(source, f.state(f.repo))
+                self.assertEqual((target / "secret/nested/data").read_bytes(), b"private tracked data\n")
+                self.assertFalse(list(target.glob(".tool-clones-*")))
+                target.chmod(0o755)
+                parent.chmod(0o755)
+
+    def test_unsafe_later_batch_is_rejected_before_any_file_is_converted(self):
+        f = self.f
+        for i in range(1100):
+            f.write(f"many/{i}", f"payload {i}\n".encode())
+        f.write("zz-unsafe/private/data", b"private tracked contents\n")
+        f.head = f.commit()
+        target = f.ordinary()
+        (target / "zz-unsafe/private").chmod(0o700)
+        (target / "zz-unsafe").chmod(0o777)
+        before = f.state(target)
+        identities = {path.relative_to(target): path.stat().st_ino for path in target.rglob("*")
+                      if path.is_file() and not path.is_symlink()}
+        out, _ = f.sprig("convert", target, "--source", f.repo, "--no-time-machine-exclude", code=3)
+        self.assertEqual(out["code"], "E_UNSUPPORTED")
+        self.assertEqual(before, f.state(target))
+        self.assertEqual(identities, {path: (target / path).stat().st_ino for path in identities})
+        self.assertFalse(f.journal_data())
+        self.assertFalse(list(target.glob(".tool-clones-*")))
+
     def test_recovery_retry_leaves_already_resolved_targets_untouched(self):
         f = self.f
         for edit in ["changed", "deleted"]:

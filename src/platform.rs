@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -533,24 +533,40 @@ pub(crate) fn has_granting_acl(path: &Path) -> Result<bool> {
 pub fn validate_workspace_parent(path: &Path) -> Result<()> {
     let user = unsafe { libc::geteuid() };
     for directory in path.ancestors() {
-        supported(directory)?;
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
-            return Err(Error::new(
-                "E_UNSUPPORTED",
-                "destination ancestors must be directories owned by the current user or root",
-            ));
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
-        }
-        // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
-        if has_granting_acl(directory)? {
-            return Err(Error::new(
-                "E_UNSUPPORTED",
-                "destination ancestors with allow ACL entries are unsupported",
-            ));
-        }
+        validate_workspace_directory(directory, user)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_workspace_parents<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    let directories: BTreeSet<_> = paths.into_iter().flat_map(Path::ancestors).collect();
+    let user = unsafe { libc::geteuid() };
+    for directory in directories {
+        validate_workspace_directory(directory, user)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_directory(directory: &Path, user: libc::uid_t) -> Result<()> {
+    supported(directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || ![0, user].contains(&metadata.uid()) {
+        return Err(Error::new(
+            "E_UNSUPPORTED",
+            "destination ancestors must be directories owned by the current user or root",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        return Err(Error::new("E_UNSUPPORTED", "destination ancestors cannot be group/world writable without sticky-directory protection"));
+    }
+    // Deny entries cannot grant rename rights; allow entries need a separate principal-aware policy.
+    if has_granting_acl(directory)? {
+        return Err(Error::new(
+            "E_UNSUPPORTED",
+            "destination ancestors with allow ACL entries are unsupported",
+        ));
     }
     Ok(())
 }
