@@ -590,6 +590,12 @@ impl Repository {
         Ok(())
     }
     pub fn idle(&self) -> Result<()> {
+        self.idle_with_cleanup_index(false)
+    }
+    pub(crate) fn idle_except_cleanup_index(&self) -> Result<()> {
+        self.idle_with_cleanup_index(true)
+    }
+    fn idle_with_cleanup_index(&self, cleanup_index: bool) -> Result<()> {
         let common = (self.common != self.admin).then_some(&self.common);
         for dir in std::iter::once(&self.admin).chain(common) {
             for name in [
@@ -604,6 +610,9 @@ impl Repository {
                 "CHERRY_PICK_HEAD",
                 "REVERT_HEAD",
             ] {
+                if cleanup_index && dir == &self.admin && name == "index.lock" {
+                    continue;
+                }
                 if dir.join(name).exists() {
                     return Err(Error::new(
                         "E_BUSY",

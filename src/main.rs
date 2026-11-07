@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use sprig::{
-    backup, config,
+    backup, cleanup, cleanup_schedule, config,
     git::Repository,
     operations::{self, CreateOptions},
     Error, Output, Result,
@@ -96,7 +96,48 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    Cleanup {
+        #[command(subcommand)]
+        action: CleanupAction,
+    },
     Capabilities,
+}
+#[derive(Subcommand)]
+enum CleanupAction {
+    /// Inspect or clean Sprig worktrees in the selected repositories (default: current repository).
+    Run {
+        #[arg(long = "repository")]
+        repositories: Vec<PathBuf>,
+        #[arg(
+            long,
+            help = "Read-only preview; does not start or advance the idle timer"
+        )]
+        dry_run: bool,
+    },
+    /// Keep a Sprig worktree warm indefinitely.
+    Pin { path: PathBuf },
+    /// Remove a pin and restart the full idle observation period.
+    Unpin { path: PathBuf },
+    /// Protect a build or running application for the lifetime of its command.
+    Hold {
+        path: PathBuf,
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+}
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Install and load an hourly per-user launchd job. Does not enable cleanup policies.
+    Install {
+        #[arg(long = "repository", required = true)]
+        repositories: Vec<PathBuf>,
+    },
+    Remove,
+    Status,
 }
 #[derive(Subcommand)]
 enum BackupAction {
@@ -171,6 +212,20 @@ fn execute(cli: &Cli) -> Result<Output> {
             path.as_deref().unwrap_or(Path::new(".")),
             *acknowledge_create,
         ),
+        Commands::Cleanup { action } => match action {
+            CleanupAction::Run {
+                repositories,
+                dry_run,
+            } => cleanup::run(repositories, *dry_run),
+            CleanupAction::Pin { path } => cleanup::pin(path, false),
+            CleanupAction::Unpin { path } => cleanup::pin(path, true),
+            CleanupAction::Hold { path, command } => cleanup::hold(path, command),
+            CleanupAction::Schedule { action } => match action {
+                ScheduleAction::Install { repositories } => cleanup_schedule::install(repositories),
+                ScheduleAction::Remove => cleanup_schedule::remove(),
+                ScheduleAction::Status => cleanup_schedule::status(),
+            },
+        },
         Commands::Capabilities => Ok(Output::success(operations::capabilities())),
         Commands::Backup { action } => {
             let (path, remove, resolve_pending) = match action {
@@ -208,6 +263,22 @@ fn execute(cli: &Cli) -> Result<Output> {
                             effective.backup_origin,
                         ),
                         "copy.ignored" => (json!(effective.ignored), effective.ignored_origin),
+                        "cleanup.enabled" => (
+                            json!(effective.cleanup.enabled),
+                            effective.cleanup_origins["enabled"].clone(),
+                        ),
+                        "cleanup.idle_hours" => (
+                            json!(effective.cleanup.idle_hours),
+                            effective.cleanup_origins["idle_hours"].clone(),
+                        ),
+                        "cleanup.folders" => (
+                            json!(effective.cleanup.folders),
+                            effective.cleanup_origins["folders"].clone(),
+                        ),
+                        "cleanup.exclude" => (
+                            json!(effective.cleanup.exclude),
+                            effective.cleanup_origins["exclude"].clone(),
+                        ),
                         _ => return Err(Error::new("E_CONFIG", "unknown configuration key")),
                     };
                     Ok(Output::success(
