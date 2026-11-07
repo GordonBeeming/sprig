@@ -1,4 +1,6 @@
 pub mod backup;
+pub mod cleanup;
+pub mod cleanup_schedule;
 pub mod config;
 pub mod git;
 mod index;

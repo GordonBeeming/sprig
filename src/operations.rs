@@ -1219,5 +1219,5 @@ pub fn recover(path: &Path, acknowledge_create: bool) -> Result<Output> {
 }
 
 pub fn capabilities() -> Value {
-    json!({"executable_name":env!("CARGO_PKG_NAME"),"description":env!("CARGO_PKG_DESCRIPTION"),"executable_version":env!("CARGO_PKG_VERSION"),"json_schema_versions":[1],"journal_schema_versions":[1,2,3],"minimum_git":"2.43","platforms":["macOS/APFS"],"commands":["create","convert","status","doctor","recover","backup","config","capabilities"],"ignored_copy_policies":["none"],"progress":"stderr","daemon_required":false})
+    json!({"executable_name":env!("CARGO_PKG_NAME"),"description":env!("CARGO_PKG_DESCRIPTION"),"executable_version":env!("CARGO_PKG_VERSION"),"json_schema_versions":[1],"journal_schema_versions":[1,2,3],"minimum_git":"2.43","platforms":["macOS/APFS"],"commands":["create","convert","status","doctor","recover","backup","config","cleanup","capabilities"],"ignored_copy_policies":["none"],"progress":"stderr","daemon_required":false})
 }

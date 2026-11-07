@@ -185,3 +185,63 @@ SPRIG_BINARY="$PWD/target/release/sprig" python3 tests/benchmark.py --output res
 The default test suite needs Python 3 and uses disposable repositories, synthetic object fixtures and real APFS syscalls. Backup tests create temporary directories under the test user's home because system temporary paths can inherit exclusions. The separate volume suite mounts bounded, disposable APFS/HFS+ disk images headlessly; it never fills a live volume. Debug-only fault injection requires `SPRIG_TEST_FAULTS=1`; release builds omit it.
 
 Read the [design](docs/design.md), [research comparison](docs/research/comparison.md), and [verification record](docs/verification.md) for the evidence, remaining questions and measured limitations.
+
+## Clean idle build outputs
+
+Cleanup is disabled by default. It applies only to registered linked worktrees with a Sprig creation or conversion receipt; the original checkout and ordinary Git worktrees are skipped.
+
+Preview all managed worktrees in a repository without changing files or starting the idle timer:
+
+```sh
+sprig cleanup run --repository /path/to/repository --dry-run --json
+```
+
+Enable cleanup for the current repository, then start observing activity:
+
+```sh
+sprig config set cleanup.enabled true --scope repository
+sprig cleanup run
+```
+
+The default idle period is six hours. Output directory names default to `bin`, `obj`, `dist`, `target`, `build` and `.next`, at any depth. Enabling cleanup approves those names as disposable build outputs. Review the preview and narrow the list or add exclusions if your project stores other data there.
+
+```sh
+sprig config set cleanup.idle_hours 6 --scope repository
+sprig config set cleanup.folders '["bin","obj","dist"]' --scope repository
+sprig config set cleanup.exclude '["tools/bin","reports/dist"]' --scope repository
+```
+
+To enable cleanup globally with the six-hour default:
+
+```sh
+sprig config set cleanup.enabled true
+sprig config set cleanup.idle_hours 6
+```
+
+Omit `--scope repository` to set user defaults. Repository settings override user settings, including an explicit `cleanup.enabled false`. The folder list replaces the inherited list. Exclusions are combined across user and repository settings, so a repository cannot drop a user exclusion. Exclusions are literal paths relative to each worktree, not glob patterns; an excluded descendant protects the containing output directory too. If an excluded path does not exist yet, Sprig conservatively protects its nearest existing ancestor inside the worktree. Dependency folder names cannot be configured as cleanup targets.
+
+Sprig removes an approved directory only when every observed entry is ignored by Git and none is tracked. It retains directories containing symlinks, special files, dependency boundaries, nested repositories, other mounts, or entries with unsafe ownership or permissions. Granting ACLs on output entries or their parents also block deletion. Ignored credentials, databases and other local data outside approved output paths are never candidates. Keep valuable data out of approved output paths or exclude those paths explicitly.
+
+Activity is observed through file identity, size and modification/change timestamps, plus HEAD and index state. Source and output edits restart the timer, and the first observation always starts a full waiting period. Git metadata, submodule contents, `node_modules`, `.venv` and `venv` are not recursively scanned. `vendor` trees and Git-ignored `packages` trees are protected dependencies; ordinary monorepo `packages/*/dist` outputs can qualify. Protected `vendor` and `packages` trees are still scanned for source activity. Metadata sampling cannot detect every change made and reverted between scans, or unsaved editor buffers.
+
+Open files, working directories and mapped executables detected by `lsof` protect a worktree and restart its timer. If that check fails, cleanup is skipped. A shell or editor left open in a worktree can therefore keep its outputs warm. For explicit protection:
+
+```sh
+sprig cleanup pin /path/to/worktree
+sprig cleanup unpin /path/to/worktree
+sprig cleanup hold /path/to/worktree -- dotnet watch
+```
+
+Unpinning starts a new observation period. `hold` keeps a shared lease while its command runs and sends command output to stderr, preserving Sprig's JSON result on stdout. Cleanup requires the exclusive lease and Git's index lock. These locks coordinate cooperating tools; they cannot stop arbitrary external writers. Sprig rechecks the scan before deletion, uses directory descriptors without following symlinks, removes only observed entries and retains unexpected new files. A residual race remains between a final check and an external filesystem change.
+
+Install the optional hourly macOS job separately:
+
+```sh
+sprig cleanup schedule install --repository /path/to/repository
+sprig cleanup schedule status
+sprig cleanup schedule remove
+```
+
+Repeat `--repository` to include several repositories in the same job. The job discovers new receipted worktrees in those repositories automatically. Installation does not enable cleanup policy. It records the current Sprig executable and the original checkout paths; use an installed executable at a stable path, and remove/reinstall the schedule if paths change. The per-user job runs on the hour while logged in. A missed run during sleep is coalesced into a run after waking.
+
+The job is stored at `~/Library/LaunchAgents/com.sprig.cleanup.plist`. Its stdout and stderr logs sit beside user configuration; manage their retention with your usual log rotation. Each worktree also retains its last 20 cleanup results in its Git administrative directory. Preview output includes that history and explains skipped candidates. Reported byte counts are logical output sizes, not a promise of physical disk space recovered on APFS.
