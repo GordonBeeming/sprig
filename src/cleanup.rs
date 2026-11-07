@@ -35,6 +35,7 @@ struct Stamp {
     mode: u32,
     uid: u32,
     len: u64,
+    nlink: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
 }
@@ -46,6 +47,7 @@ impl Stamp {
             mode: m.mode(),
             uid: m.uid(),
             len: m.len(),
+            nlink: m.nlink(),
             mtime: (m.mtime(), m.mtime_nsec()),
             ctime: (m.ctime(), m.ctime_nsec()),
         }
@@ -203,6 +205,7 @@ fn stamp_at(dir: &File, name: &OsStr) -> Result<Stamp> {
         mode: s.st_mode as u32,
         uid: s.st_uid,
         len: s.st_size as u64,
+        nlink: u64::from(s.st_nlink),
         mtime,
         ctime,
     })
@@ -269,6 +272,18 @@ fn paths(bytes: &[u8]) -> Result<BTreeSet<PathBuf>> {
         })
         .collect()
 }
+fn granting_acl(
+    repo: &Repository,
+    path: &Path,
+    cache: &mut BTreeMap<PathBuf, bool>,
+) -> Result<bool> {
+    if let Some(value) = cache.get(path) {
+        return Ok(*value);
+    }
+    let value = crate::platform::has_granting_acl(&repo.root.join(path))?;
+    cache.insert(path.to_path_buf(), value);
+    Ok(value)
+}
 fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Result<Scan> {
     let index = repo.index()?;
     let tracked: BTreeSet<PathBuf> = index
@@ -320,6 +335,7 @@ fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Resul
         0,
     )?;
     let mut candidates: Vec<Candidate> = Vec::new();
+    let mut acl_cache = BTreeMap::new();
     for (path, stamp) in &stamps {
         if !stamp.directory()
             || !policy.folders.iter().any(|name| {
@@ -335,6 +351,24 @@ fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Resul
             logical_bytes: 0,
             reason: None,
         };
+        if excluded_inodes.contains(&(root_stamp.dev, root_stamp.ino)) {
+            candidate.reason = Some("excluded".into());
+        }
+        for parent in path
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let stamp = stamps
+                .get(parent)
+                .ok_or_else(|| Error::new("E_CHANGED", "missing candidate ancestor"))?;
+            if stamp.uid != unsafe { libc::geteuid() }
+                || stamp.mode & 0o022 != 0
+                || granting_acl(repo, parent, &mut acl_cache)?
+            {
+                candidate.reason = Some("unsafe_parent".into());
+            }
+        }
         if policy.exclude.iter().any(|p| {
             folded(path).starts_with(folded(Path::new(p)))
                 || folded(Path::new(p)).starts_with(folded(path))
@@ -347,6 +381,10 @@ fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Resul
             }
             if excluded_inodes.contains(&(value.dev, value.ino)) {
                 candidate.reason = Some("excluded".into());
+            }
+            if (value.regular() || value.directory()) && granting_acl(repo, child, &mut acl_cache)?
+            {
+                candidate.reason = Some("granting_acl".into());
             }
             if value.regular() {
                 candidate.logical_bytes = candidate.logical_bytes.saturating_add(value.len);
@@ -400,6 +438,29 @@ fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Resul
             wanted.insert(path.clone());
         }
     }
+    let dependency_roots: Vec<_> = stamps
+        .iter()
+        .filter(|(p, s)| {
+            s.directory()
+                && p.file_name().is_some_and(|n| {
+                    n.eq_ignore_ascii_case(OsStr::new("vendor"))
+                        || n.eq_ignore_ascii_case(OsStr::new("packages"))
+                })
+                || (s.directory()
+                    && p.parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|n| n.eq_ignore_ascii_case(OsStr::new("packages"))))
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    for path in &dependency_roots {
+        input.extend_from_slice(
+            path.to_str()
+                .ok_or_else(|| Error::new("E_UNSUPPORTED", "non-UTF-8 dependency path"))?
+                .as_bytes(),
+        );
+        input.push(0);
+    }
     let ignored = if input.is_empty() {
         BTreeSet::new()
     } else {
@@ -419,6 +480,15 @@ fn scan(repo: &Repository, root: &File, policy: &config::CleanupPolicy) -> Resul
         )?
     };
     for candidate in &mut candidates {
+        if dependency_roots.iter().any(|root| {
+            (root
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(OsStr::new("vendor")))
+                || ignored.contains(root))
+                && (candidate.path.starts_with(root) || root.starts_with(&candidate.path))
+        }) {
+            candidate.reason = Some("dependency_boundary".into());
+        }
         if candidate.reason.is_none()
             && wanted
                 .range(candidate.path.clone()..)
@@ -654,8 +724,18 @@ fn in_use(repo: &Repository, paths: &Usage) -> Result<bool> {
     }
     Ok(false)
 }
-fn delete_candidate(root: &File, scan: &Scan, candidate: &Candidate) -> Result<u64> {
-    let mut removed = 0;
+#[derive(Default)]
+struct DeletionProgress {
+    logical_bytes: u64,
+    paths: Vec<PathBuf>,
+}
+fn delete_candidate(
+    root: &File,
+    scan: &Scan,
+    candidate: &Candidate,
+    links: &mut BTreeMap<(u64, u64), Stamp>,
+    progress: &mut DeletionProgress,
+) -> Result<()> {
     // Delete only observed entries through pinned, no-follow directory descriptors.
     // Unexpected files survive; rmdir then fails rather than recursively removing them.
     let mut entries: Vec<_> = scan
@@ -674,6 +754,7 @@ fn delete_candidate(root: &File, scan: &Scan, candidate: &Candidate) -> Result<u
             .file_name()
             .ok_or_else(|| Error::new("E_STATE", "missing output name"))?;
         let current = stamp_at(&parent, name)?;
+        let expected = links.get(&(stamp.dev, stamp.ino)).unwrap_or(stamp);
         // Removing children changes a directory's timestamps and size, but not its identity.
         if if stamp.directory() {
             current.dev != stamp.dev
@@ -681,7 +762,7 @@ fn delete_candidate(root: &File, scan: &Scan, candidate: &Candidate) -> Result<u
                 || current.mode != stamp.mode
                 || current.uid != stamp.uid
         } else {
-            current != *stamp
+            current != *expected
         } {
             return Err(Error::new(
                 "E_CHANGED",
@@ -689,6 +770,30 @@ fn delete_candidate(root: &File, scan: &Scan, candidate: &Candidate) -> Result<u
             ));
         }
         let name = cstring(name)?;
+        let linked_file = if stamp.regular() && expected.nlink > 1 {
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            if Stamp::new(&file.metadata()?) != *expected
+                || stamp_at(&parent, OsStr::from_bytes(name.as_bytes()))? != *expected
+            {
+                return Err(Error::new(
+                    "E_CHANGED",
+                    "hard-linked output changed before cleanup",
+                ));
+            }
+            Some(file)
+        } else {
+            None
+        };
         if unsafe {
             libc::unlinkat(
                 parent.as_raw_fd(),
@@ -703,11 +808,30 @@ fn delete_candidate(root: &File, scan: &Scan, candidate: &Candidate) -> Result<u
         {
             return Err(std::io::Error::last_os_error().into());
         }
+        progress.paths.push(path.clone());
         if stamp.regular() {
-            removed += stamp.len;
+            progress.logical_bytes = progress.logical_bytes.saturating_add(stamp.len);
+        }
+        if let Some(file) = linked_file {
+            // Unlink changes the shared inode's ctime. Capture our own change from
+            // a pinned descriptor; every sibling still gets full stamp validation.
+            let after = Stamp::new(&file.metadata()?);
+            let mut expected_after = expected.clone();
+            expected_after.ctime = after.ctime;
+            expected_after.nlink = after.nlink;
+            if after != expected_after || after.nlink.checked_add(1) != Some(expected.nlink) {
+                return Err(Error::new(
+                    "E_CHANGED",
+                    "hard-linked output changed during cleanup",
+                ));
+            }
+            links.insert((after.dev, after.ino), after);
+        }
+        if stamp.regular() {
+            state::boundary("cleanup_unlinked")?;
         }
     }
-    Ok(removed)
+    Ok(())
 }
 fn worktree(repo: &Repository, dry_run: bool, usage: &mut Option<Usage>) -> Result<Value> {
     let policy = config::effective(Some(repo), None)?.cleanup;
@@ -795,6 +919,10 @@ fn worktree(repo: &Repository, dry_run: bool, usage: &mut Option<Usage>) -> Resu
     if !dry_run && policy.enabled {
         state::atomic_json(&repo.admin.join(STATE), &observation)?;
         if reason == "eligible" {
+            // Any failure or late activity must start a fresh observation window.
+            observation.fingerprint.clear();
+            observation.stable_since = now;
+            state::atomic_json(&repo.admin.join(STATE), &observation)?;
             let _index_lock = gix_lock::File::acquire_to_update_resource(
                 repo.admin.join("index"),
                 gix_lock::acquire::Fail::Immediately,
@@ -804,30 +932,38 @@ fn worktree(repo: &Repository, dry_run: bool, usage: &mut Option<Usage>) -> Resu
             state::boundary("cleanup_before_delete")?;
             repo.idle_except_cleanup_index()?;
             let recheck = scan_check(repo, &root, &policy, &scan)?;
-            if !recheck
-                || pinned(repo)?
-                || in_use(repo, &open_paths().map_err(|e| e.message))?
-                || config::effective(Some(repo), None)?.cleanup.enabled != policy.enabled
-            {
+            if !recheck || pinned(repo)? || in_use(repo, &open_paths().map_err(|e| e.message))? {
                 return Err(Error::new(
                     "E_CHANGED",
-                    "worktree or policy changed before cleanup",
+                    "worktree or activity changed before cleanup",
                 ));
             }
-            let mut removed = 0;
+            state::boundary("cleanup_after_activity")?;
+            if config::effective(Some(repo), None)?.cleanup != policy {
+                return Err(Error::new(
+                    "E_CHANGED",
+                    "cleanup policy changed before deletion",
+                ));
+            }
+            let mut removed: u64 = 0;
             let mut completed = Vec::new();
+            let mut links = BTreeMap::new();
             for candidate in &scan.candidates {
                 if candidate.reason.is_none() {
-                    if let Err(e) = delete_candidate(&root, &scan, candidate) {
-                        observation.history.push(json!({"at":now,"error":e.message,"completed":completed,"removed_logical_bytes":removed}));
+                    let mut progress = DeletionProgress::default();
+                    if let Err(e) =
+                        delete_candidate(&root, &scan, candidate, &mut links, &mut progress)
+                    {
+                        removed = removed.saturating_add(progress.logical_bytes);
+                        observation.history.push(json!({"at":now,"error":e.message,"completed":completed,"partial_candidate":candidate.path,"removed_paths":progress.paths,"removed_logical_bytes":removed}));
                         if observation.history.len() > 20 {
                             observation.history.remove(0);
                         }
                         observation.stable_since = now;
                         state::atomic_json(&repo.admin.join(STATE), &observation)?;
-                        return Err(e.with_data(json!({"worktree":repo.root,"completed":completed,"removed_logical_bytes":removed})));
+                        return Err(e.with_data(json!({"worktree":repo.root,"completed":completed,"partial_candidate":candidate.path,"removed_paths":progress.paths,"removed_logical_bytes":removed})));
                     }
-                    removed += candidate.logical_bytes;
+                    removed += progress.logical_bytes;
                     completed.push(candidate.path.clone());
                 }
             }

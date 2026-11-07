@@ -50,6 +50,17 @@ class Cleanup(unittest.TestCase):
         state["stable_since"] -= 6 * 3600 + 1
         self.state.write_text(json.dumps(state))
 
+    def paused_cleanup(self,boundary):
+        ready=Path(self.temp.name)/(boundary+".ready")
+        release=Path(self.temp.name)/(boundary+".release")
+        env=dict(self.f.env,SPRIG_TEST_FAULTS="1",SPRIG_TEST_PAUSE=boundary,SPRIG_TEST_READY=str(ready),SPRIG_TEST_RELEASE=str(release))
+        process=subprocess.Popen([BINARY,"--json","cleanup","run","--repository",str(self.f.repo)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        deadline=time.monotonic()+20
+        while not ready.exists() and time.monotonic()<deadline and process.poll() is None:time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        return process,release
+
     def test_preview_observe_then_clean_only_outputs(self):
         original_index = (self.admin / "index").read_bytes()
         original_head = self.f.git("rev-parse", "HEAD", path=self.target)
@@ -274,6 +285,128 @@ class Cleanup(unittest.TestCase):
         self.age()
         self.cleanup()
         self.assertTrue((self.target/"bin/keep.cs").exists())
+
+    def test_dependency_boundaries_and_monorepo_outputs(self):
+        self.write(".gitignore",b"bin/\nobj/\ndist/\nvendor/\nlegacy/packages/\ncontents/packages/*\nnode_modules/\n")
+        self.write("vendor/bin/tool",b"downloaded dependency")
+        self.write("legacy/packages/Example.1.0/build/Example.targets",b"NuGet dependency")
+        self.write("contents/packages/Example.1.0/build/Example.targets",b"NuGet dependency")
+        self.write("packages/ui/package.json",b"{}")
+        self.f.git("add","packages/ui/package.json",path=self.target)
+        self.write("packages/ui/dist/bundle.js",b"rebuildable monorepo output")
+        row,_,_=self.cleanup(True)
+        reasons={c["path"]:c["reason"] for c in row["candidates"]}
+        self.assertEqual(reasons["vendor/bin"],"dependency_boundary")
+        self.assertEqual(reasons["legacy/packages/Example.1.0/build"],"dependency_boundary")
+        self.assertEqual(reasons["contents/packages/Example.1.0/build"],"dependency_boundary")
+        self.assertIsNone(reasons["packages/ui/dist"])
+        self.cleanup();self.age();self.cleanup()
+        self.assertTrue((self.target/"vendor/bin/tool").exists())
+        self.assertTrue((self.target/"legacy/packages/Example.1.0/build/Example.targets").exists())
+        self.assertTrue((self.target/"contents/packages/Example.1.0/build/Example.targets").exists())
+        self.assertFalse((self.target/"packages/ui/dist").exists())
+        self.assertTrue((self.target/"packages/ui/package.json").exists())
+
+    def test_hard_links_within_and_across_output_directories(self):
+        self.write(".gitignore",b"bin/\nobj/\ndist/\ntarget/\nnode_modules/\n")
+        first=self.write("target/debug/deps/app-hash",b"compiled binary")
+        os.link(first,self.target/"target/debug/app")
+        (self.target/"obj").mkdir()
+        os.link(first,self.target/"obj/app")
+        external=Path(self.temp.name)/"external-link"
+        os.link(first,external)
+        self.cleanup();self.age()
+        row,_,_=self.cleanup()
+        self.assertEqual(row["reason"],"cleaned")
+        self.assertFalse((self.target/"target").exists())
+        self.assertFalse((self.target/"obj").exists())
+        self.assertEqual(external.read_bytes(),b"compiled binary")
+
+    def test_concurrent_hard_link_edit_is_retained(self):
+        self.setting("cleanup.folders", '["target"]')
+        self.write(".gitignore",b"target/\n")
+        first=self.write("target/deps/app-hash",b"compiled binary")
+        os.link(first,self.target/"target/app")
+        external=Path(self.temp.name)/"external-writer"
+        os.link(first,external)
+        self.cleanup();self.age()
+        ready=Path(self.temp.name)/"link-ready";release=Path(self.temp.name)/"link-release"
+        env=dict(self.f.env,SPRIG_TEST_FAULTS="1",SPRIG_TEST_PAUSE="cleanup_unlinked",SPRIG_TEST_READY=str(ready),SPRIG_TEST_RELEASE=str(release))
+        process=subprocess.Popen([BINARY,"--json","cleanup","run","--repository",str(self.f.repo)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        deadline=time.monotonic()+20
+        while not ready.exists() and time.monotonic()<deadline and process.poll() is None:time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        external.write_bytes(b"concurrent changed contents")
+        release.touch()
+        stdout,stderr=process.communicate(timeout=20)
+        self.assertEqual(process.returncode,6,(stdout,stderr))
+        self.assertEqual((self.target/"target/app").read_bytes(),b"concurrent changed contents")
+        report=json.loads(stdout)
+        error=next(e for e in report["data"]["errors"] if e["worktree"]==str(self.target.resolve()))
+        self.assertEqual(error["data"]["removed_logical_bytes"],len(b"compiled binary"))
+        self.assertIn("target/deps/app-hash",error["data"]["removed_paths"])
+        self.assertEqual(json.loads(self.state.read_text())["history"][-1]["removed_logical_bytes"],len(b"compiled binary"))
+
+    def test_unsafe_output_parent_is_protected(self):
+        (self.target/"src").chmod(0o777)
+        row,_,_=self.cleanup(True)
+        reasons={c["path"]:c["reason"] for c in row["candidates"]}
+        self.assertEqual(reasons["src/bin"],"unsafe_parent")
+        self.assertEqual(reasons["src/obj"],"unsafe_parent")
+        self.cleanup();self.age();self.cleanup()
+        self.assertTrue((self.target/"src/bin/Debug/app.dll").exists())
+
+    def test_granting_acls_on_outputs_and_parents_are_protected(self):
+        run("chmod","+a","everyone allow add_file,delete_child",str(self.target/"src/bin"))
+        run("chmod","+a","everyone allow write",str(self.target/"src/obj/project.assets.json"))
+        row,_,_=self.cleanup(True)
+        reasons={c["path"]:c["reason"] for c in row["candidates"]}
+        self.assertEqual(reasons["src/bin"],"granting_acl")
+        self.assertEqual(reasons["src/obj"],"granting_acl")
+        self.cleanup();self.age();self.cleanup()
+        self.assertTrue((self.target/"src/bin/Debug/app.dll").exists())
+        run("chmod","-N",str(self.target/"src/bin"))
+        run("chmod","-N",str(self.target/"src/obj/project.assets.json"))
+        run("chmod","+a","everyone allow add_file,delete_child",str(self.target/"src"))
+        row,_,_=self.cleanup(True)
+        reasons={c["path"]:c["reason"] for c in row["candidates"]}
+        self.assertEqual(reasons["src/bin"],"unsafe_parent")
+
+    def test_missing_exclusion_protects_nearest_root(self):
+        self.setting("cleanup.exclude", '["future/cache"]')
+        row,_,_=self.cleanup(True)
+        self.assertTrue(all(c["reason"]=="excluded" for c in row["candidates"]))
+        self.cleanup();self.age();self.cleanup()
+        self.assertTrue((self.target/"src/bin/Debug/app.dll").exists())
+
+    def test_final_policy_recheck_catches_new_exclusion(self):
+        self.cleanup();self.age()
+        process,release=self.paused_cleanup("cleanup_after_activity")
+        self.setting("cleanup.exclude", '["src/bin"]')
+        release.touch()
+        stdout,stderr=process.communicate(timeout=20)
+        self.assertEqual(process.returncode,6,(stdout,stderr))
+        self.assertTrue((self.target/"src/bin/Debug/app.dll").exists())
+        self.assertTrue((self.target/"src/obj").exists())
+        self.assertEqual(json.loads(self.state.read_text())["fingerprint"],"")
+        row,_,_=self.cleanup()
+        self.assertEqual(row["reason"],"observing")
+
+    def test_late_activity_requires_new_idle_observation(self):
+        self.cleanup();self.age()
+        process,release=self.paused_cleanup("cleanup_before_delete")
+        app=subprocess.Popen(["/bin/sleep","30"],cwd=self.target)
+        try:
+            release.touch()
+            stdout,stderr=process.communicate(timeout=20)
+            self.assertEqual(process.returncode,6,(stdout,stderr))
+        finally:
+            app.terminate();app.wait(timeout=5)
+        self.assertEqual(json.loads(self.state.read_text())["fingerprint"],"")
+        row,_,_=self.cleanup()
+        self.assertEqual(row["reason"],"observing")
+        self.assertTrue((self.target/"src/bin/Debug/app.dll").exists())
 
     def test_schedule_install_run_and_remove_with_disabled_fixture(self):
         domain = f"gui/{os.getuid()}"

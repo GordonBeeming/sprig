@@ -36,7 +36,7 @@ pub struct Cleanup {
     pub folders: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CleanupPolicy {
     pub enabled: bool,
     pub idle_hours: u64,
