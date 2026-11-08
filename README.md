@@ -50,6 +50,8 @@ External APFS drives can mount with ownership disabled. Enable volume ownership 
 
 Creation requires a clean source: no staged, unstaged, conflicted or non-ignored untracked files. Ignored files are omitted. The initial dependency/cache policy is `copy.ignored = "none"`; no ignored directories, environment files or credentials are copied. If a target has no reusable files, creation reports `W_NO_SHARED_FILES` and partial success so the absence of sharing is visible.
 
+For newly created workspaces, cloned files preserve the source group when the current process can assign it. Otherwise they inherit the destination directory's group, as ordinary newly created files do. This supports temporary checkouts whose files belong to `wheel` while the user belongs to `staff`. Source metadata remains unchanged. Conversion and index updates continue to require exact group preservation.
+
 Creation also screens donor metadata: files with ACLs or xattrs other than the OS-generated `com.apple.provenance` are materialised through Git, so donor-only private metadata is not copied into the new workspace. Conversion instead preserves the existing target's metadata.
 
 Stop editors, builds and Git operations in participating worktrees before running either command. The repository lock coordinates Sprig instances; it cannot stop another program or a process holding an old file descriptor. Hash, identity and metadata checks detect many external changes, with a residual race between a check and a filesystem mutation.

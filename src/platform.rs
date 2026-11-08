@@ -117,6 +117,41 @@ fn open_regular_with_metadata(path: &Path) -> Result<(File, fs::Metadata)> {
     Ok((file, m))
 }
 
+pub(crate) struct CreationGroups {
+    assignable: BTreeSet<u32>,
+    privileged: bool,
+}
+impl CreationGroups {
+    pub(crate) fn capture() -> Result<Self> {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let length = usize::try_from(count).map_err(|e| Error::new("E_IO", e.to_string()))?;
+        let mut groups = vec![0; length];
+        let written = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        groups.truncate(usize::try_from(written).map_err(|e| Error::new("E_IO", e.to_string()))?);
+        let mut assignable: BTreeSet<u32> = groups.into_iter().collect();
+        assignable.insert(unsafe { libc::getegid() });
+        Ok(Self {
+            assignable,
+            privileged: unsafe { libc::geteuid() } == 0,
+        })
+    }
+    pub(crate) fn expected_gid(&self, source: u32, destination_parent: u32) -> u32 {
+        // Shared temporary roots can give a donor a group its owner cannot assign.
+        // A new private workspace can inherit its own parent group instead.
+        if self.privileged || self.assignable.contains(&source) {
+            source
+        } else {
+            destination_parent
+        }
+    }
+}
+
 pub fn preserve_group(path: &Path, gid: u32) -> Result<()> {
     use std::os::fd::AsRawFd;
 

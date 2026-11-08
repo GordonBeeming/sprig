@@ -216,6 +216,7 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
         return Ok(Output::success(preview));
     }
     platform::supported(&repo.root)?;
+    let creation_groups = platform::CreationGroups::capture()?;
     let _lock = Lock::acquire(&repo)?;
     state::require_recovered(&repo)?;
     destination(&repo, &dest)?;
@@ -335,17 +336,23 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
                         && before.acl.is_empty()
                         && before.xattrs.keys().all(|k| k == "com.apple.provenance")
                     {
+                        let parent = target_path
+                            .parent()
+                            .ok_or_else(|| Error::new("E_STATE", "clone parent missing"))?;
+                        let mut expected = before.clone();
+                        expected.gid =
+                            creation_groups.expected_gid(before.gid, fs::metadata(parent)?.gid());
                         platform::clone(&donor, &target_path)?;
-                        platform::preserve_group(&target_path, before.gid)?;
+                        platform::preserve_group(&target_path, expected.gid)?;
                         state::boundary("create_cloned")?;
                         let after = platform::fingerprint(&target_path)?;
-                        if !before.preserves(&after) {
-                            let differences = before.preservation_differences(&after);
+                        if !expected.preserves(&after) {
+                            let differences = expected.preservation_differences(&after);
                             let fields = differences.keys().cloned().collect::<Vec<_>>().join(", ");
                             return Err(Error::new(
                                 "E_CHANGED",
                                 format!("clone metadata/bytes did not match source ({fields}): {}", target_path.display()),
-                            ).with_data(json!({"path":target_path,"source":donor,"kind":"clone_preservation","expected":before,"observed":after,"differences":differences})));
+                            ).with_data(json!({"path":target_path,"source":donor,"kind":"clone_preservation","expected":expected,"observed":after,"differences":differences})));
                         }
                         let donor_after = platform::fingerprint(&donor)?;
                         if !donor_after.unchanged(&before) {
