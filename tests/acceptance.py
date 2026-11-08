@@ -590,35 +590,37 @@ class Acceptance(unittest.TestCase):
         self.assertNotEqual(run("xattr", "-p", "test.donor-only", str(target / "b"), check=False).returncode, 0)
 
     def test_create_from_temporary_source_with_unassignable_group(self):
-        with tempfile.TemporaryDirectory(prefix="sprig-group-source-",dir="/private/tmp") as base:
-            f=Fixture(base)
-            f.write(".claude/settings.json",b'{"example":true}\n')
-            f.git("add","-f",".claude/settings.json")
+        with tempfile.TemporaryDirectory(prefix="sprig-group-source-", dir="/private/tmp") as base:
+            f = Fixture(base)
+            f.write(".claude/settings.json", b'{"example":true}\n')
+            f.git("add", "-f", ".claude/settings.json")
             f.commit()
-            source=f.repo/".claude/settings.json"
-            source_group=source.stat().st_gid
-            if os.geteuid()==0 or source_group in {*os.getgroups(),os.getegid()}:
+            source = f.repo / ".claude/settings.json"
+            source_group = source.stat().st_gid
+            if os.geteuid() == 0 or source_group in {*os.getgroups(), os.getegid()}:
                 self.skipTest("temporary directory group is assignable to this user")
-            before=f.state(f.repo)
-            source_metadata={name:(f.repo/name).stat() for name in ["a","b","executable",".claude/settings.json"]}
-            with tempfile.TemporaryDirectory(prefix="sprig-group-destination-",dir=Path.home()) as directory:
-                target=Path(directory)/"workspace"
-                destination_group=Path(directory).stat().st_gid
-                self.assertNotEqual(source_group,destination_group)
-                out,_=f.sprig("create",target,"--from",f.repo,"--no-time-machine-exclude")
-                self.assertGreater(out["data"]["cloned_files"],0)
-                for name,metadata in source_metadata.items():
-                    original=f.repo/name;clone=target/name
-                    self.assertEqual(clone.stat().st_gid,destination_group)
-                    self.assertEqual(clone.stat().st_mode,metadata.st_mode)
-                    self.assertEqual(clone.read_bytes(),original.read_bytes())
-                    self.assertEqual(original.stat().st_gid,metadata.st_gid)
-                    self.assertEqual(original.stat().st_ctime_ns,metadata.st_ctime_ns)
-                    self.assertEqual(original.stat().st_mtime_ns,metadata.st_mtime_ns)
-                self.assertEqual(f.git("status","--porcelain",path=target),b"")
-                self.assertEqual(f.git("rev-parse","HEAD",path=target),f.git("rev-parse","HEAD"))
-                self.assertEqual(before,f.state(f.repo))
-                self.assertFalse(list((f.repo/".git/tool/operations").glob("*.json")))
+            before = f.state(f.repo)
+            source_metadata = {name: (f.repo / name).stat() for name in
+                               ["a", "b", "executable", ".claude/settings.json"]}
+            with tempfile.TemporaryDirectory(prefix="sprig-group-destination-", dir=Path.home()) as directory:
+                target = Path(directory) / "workspace"
+                destination_group = Path(directory).stat().st_gid
+                self.assertNotEqual(source_group, destination_group)
+                out, _ = f.sprig("create", target, "--from", f.repo, "--no-time-machine-exclude")
+                self.assertGreater(out["data"]["cloned_files"], 0)
+                for name, metadata in source_metadata.items():
+                    original = f.repo / name
+                    clone = target / name
+                    self.assertEqual(clone.stat().st_gid, destination_group)
+                    self.assertEqual(clone.stat().st_mode, metadata.st_mode)
+                    self.assertEqual(clone.read_bytes(), original.read_bytes())
+                    self.assertEqual(original.stat().st_gid, metadata.st_gid)
+                    self.assertEqual(original.stat().st_ctime_ns, metadata.st_ctime_ns)
+                    self.assertEqual(original.stat().st_mtime_ns, metadata.st_mtime_ns)
+                self.assertEqual(f.git("status", "--porcelain", path=target), b"")
+                self.assertEqual(f.git("rev-parse", "HEAD", path=target), f.git("rev-parse", "HEAD"))
+                self.assertEqual(before, f.state(f.repo))
+                self.assertFalse(list((f.repo / ".git/tool/operations").glob("*.json")))
 
     def test_create_preserves_group_across_shared_destination_roots(self):
         base = Path(tempfile.mkdtemp(prefix="sprig-group-source-", dir=Path.home()))
