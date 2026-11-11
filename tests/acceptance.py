@@ -692,6 +692,35 @@ class Acceptance(unittest.TestCase):
                         child.kill()
                         child.communicate()
 
+    def test_creation_accepts_clone_access_time_change(self):
+        f = self.f
+        target = f.base / "atime-workspace"
+        ready, release = f.base / "atime-ready", f.base / "atime-release"
+        env = dict(f.env, SPRIG_TEST_FAULTS="1", SPRIG_TEST_PAUSE="create_cloned",
+                   SPRIG_TEST_READY=str(ready), SPRIG_TEST_RELEASE=str(release))
+        child = subprocess.Popen([BINARY, "--json", "create", str(target), "--from", str(f.repo),
+                                  "--no-time-machine-exclude"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            clone = target / ".gitignore"
+            metadata = clone.stat()
+            # A Spotlight or Quick Look read of a freshly written file moves only its access time.
+            os.utime(clone, ns=(metadata.st_atime_ns + 5_000_000_000, metadata.st_mtime_ns))
+            release.write_text("continue")
+            stdout, stderr = child.communicate(timeout=CHILD_FINISH_TIMEOUT)
+            self.assertEqual(child.returncode, 0, (stdout, stderr))
+            self.assertEqual(json.loads(stdout)["code"], "OK")
+            self.assertEqual(f.git("status", "--porcelain", path=target), b"")
+            self.assertFalse(list((f.repo / ".git/tool/operations").glob("*.json")))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+
     def test_creation_hook_and_partial_success(self):
         f = self.f
         hook = f.repo / ".git/hooks/post-checkout"

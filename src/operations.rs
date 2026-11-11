@@ -346,8 +346,10 @@ pub fn create(source: &Path, dest: &Path, opts: &CreateOptions) -> Result<Output
                         platform::preserve_group(&target_path, expected.gid)?;
                         state::boundary("create_cloned")?;
                         let after = platform::fingerprint(&target_path)?;
-                        if !expected.preserves(&after) {
-                            let differences = expected.preservation_differences(&after);
+                        // A new workspace file has no access history to keep, and any reader of the
+                        // donor or clone (Spotlight, Quick Look, this verification) can move atime.
+                        if !expected.equivalent(&after) {
+                            let differences = expected.equivalence_differences(&after);
                             let fields = differences.keys().cloned().collect::<Vec<_>>().join(", ");
                             return Err(Error::new(
                                 "E_CHANGED",
