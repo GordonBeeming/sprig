@@ -66,6 +66,18 @@ impl Fingerprint {
     }
 
     pub fn preservation_differences(&self, other: &Self) -> BTreeMap<String, serde_json::Value> {
+        let mut differences = self.equivalence_differences(other);
+        if self.atime != other.atime {
+            differences.insert(
+                "atime".into(),
+                serde_json::json!({"expected": self.atime, "observed": other.atime}),
+            );
+        }
+        differences
+    }
+
+    /// The fields `equivalent` compares, so a failed check never names a field it ignores.
+    pub fn equivalence_differences(&self, other: &Self) -> BTreeMap<String, serde_json::Value> {
         let mut differences = BTreeMap::new();
         macro_rules! fields {
             ($($field:ident),+ $(,)?) => {$(
@@ -76,7 +88,7 @@ impl Fingerprint {
                 }
             )+};
         }
-        fields!(len, mode, uid, gid, mtime, atime, birth, flags, digest, acl);
+        fields!(len, mode, uid, gid, mtime, birth, flags, digest, acl);
         for name in self.xattrs.keys().chain(other.xattrs.keys()) {
             if name != "com.apple.provenance" && self.xattrs.get(name) != other.xattrs.get(name) {
                 differences.insert(
